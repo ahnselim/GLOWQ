@@ -1,0 +1,21 @@
+name: glowq
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      # Install PyTorch separately after env creation to match your CUDA setup.
+      - transformers
+      - datasets
+      - accelerate
+      - tqdm
+      - sentencepiece
+      - numpy
+      - pandas
+      - matplotlib
+      - seaborn
+      - triton
+      - lm-eval
+      - ninja
+      - tomli; python_version < "3.11"

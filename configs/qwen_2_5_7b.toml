@@ -1,0 +1,30 @@
+model_name = "Qwen/Qwen2.5-7B"
+svd_rank = 64
+
+# Step2 covariance calibration dataset (HF datasets name)
+calibration_dataset = "DKYoon/SlimPajama-6B"
+calibration_n_samples = 32
+
+# Step3 PPL dataset: wiki | c4 | ptb
+ppl_dataset = "wiki"
+
+# If true, run src/step3_decode_cache_lm.py with lm-eval-harness enabled.
+# If false, run src/step3_decode_cache_nodict_eval.py.
+lm_harness = false
+
+# Optional runtime settings
+device = "cuda:0"
+group_size = 128
+trust_remote_code = true
+calibration_seq_len = 2048
+output_dir = "outputs/qwen_2_5_7b"
+
+# Optional step3 settings
+skip_gen = false
+eval_max_docs = 64
+eval_seq_len = 2048
+
+# Optional harness settings (used when lm_harness = true)
+harness_tasks = "arc_easy,piqa,boolq"
+harness_batch_size = 1
+harness_num_fewshot = 0
