@@ -6,7 +6,6 @@ output :
 |-- low_rank_shared.pt    (shared low-rank tensors)
 `-- b_ref_map.json        (module-to-shared-B mapping)
 (optional)
-`-- <log_path>            (.log)
 """
 
 import os
@@ -15,7 +14,7 @@ import json
 import torch
 import argparse
 import logging
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 from tqdm import tqdm
 from collections import defaultdict
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -32,14 +31,6 @@ formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 ch.setFormatter(formatter)
 if not logger.handlers:
     logger.addHandler(ch)
-
-
-def setup_file_logger(log_path: str):
-    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
-    fh = logging.FileHandler(log_path, mode="w", encoding="utf-8")
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
 
 
 def load_data(path: str) -> Dict[str, torch.Tensor]:
@@ -201,6 +192,18 @@ def estimate_input_covariance(
             )
             individual_module_data[module_key] = data_list
 
+    total_cov_jobs = sum(
+        1
+        for groups in layer_group_data.values()
+        for data_list in groups.values()
+        if data_list
+    ) + sum(1 for data_list in individual_module_data.values() if data_list)
+    cov_pbar = (
+        tqdm(total=total_cov_jobs, desc="Covariance Shrinkage")
+        if total_cov_jobs > 0
+        else None
+    )
+
     for layer_idx, groups in layer_group_data.items():
         for group_type, data_list in groups.items():
             if not data_list:
@@ -218,6 +221,8 @@ def estimate_input_covariance(
             else:
                 stable_cov = cov + (1e-6 * torch.eye(d, device=cov.device))
             cov_matrices[group_key] = stable_cov.cpu()
+            if cov_pbar is not None:
+                cov_pbar.update(1)
 
     for module_key, data_list in individual_module_data.items():
         x_cat = torch.cat(data_list, dim=0).to(torch.float32)
@@ -231,22 +236,60 @@ def estimate_input_covariance(
         else:
             stable_cov = cov + (1e-6 * torch.eye(d, device=cov.device))
         cov_matrices[module_key] = stable_cov.cpu()
+        if cov_pbar is not None:
+            cov_pbar.update(1)
+
+    if cov_pbar is not None:
+        cov_pbar.close()
 
     logger.info(f"Estimated {len(cov_matrices)} unique covariance matrices.")
     return cov_matrices
 
 
 def calculate_matrix_sqrt_and_inv_sqrt(
-    S: torch.Tensor, device: torch.device
+    S: torch.Tensor, device: torch.device, matrix_name: Optional[str] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    S_gpu = S.to(device, dtype=torch.float64)
-    L, Q = torch.linalg.eigh(S_gpu)
-    L, Q = L.to(torch.float32), Q.to(torch.float32)
-    L_sqrt = torch.sqrt(torch.clamp(L, min=1e-8)).diag()
-    L_inv_sqrt = (1.0 / torch.sqrt(torch.clamp(L, min=1e-8))).diag()
-    S_sqrt = Q @ L_sqrt @ Q.T
-    S_inv_sqrt = Q @ L_inv_sqrt @ Q.T
-    return S_sqrt.cpu(), S_inv_sqrt.cpu()
+    label = matrix_name or "<unnamed>"
+    last_error = None
+
+    candidate_backends = []
+    if device.type == "cuda":
+        candidate_backends.extend(
+            [
+                ("cuda-float64", device, torch.float64),
+                ("cuda-float32", device, torch.float32),
+            ]
+        )
+    candidate_backends.append(("cpu-float64", torch.device("cpu"), torch.float64))
+
+    for backend_label, target_device, dtype in candidate_backends:
+        try:
+            S_work = S.to(target_device, dtype=dtype)
+            # Numeric noise from covariance estimation can break symmetry slightly.
+            S_work = 0.5 * (S_work + S_work.T)
+            L, Q = torch.linalg.eigh(S_work)
+
+            L = L.to(torch.float32)
+            Q = Q.to(torch.float32)
+            L_clamped = torch.clamp(L, min=1e-8)
+            L_sqrt = torch.sqrt(L_clamped)
+            L_inv_sqrt = 1.0 / L_sqrt
+
+            # Scale eigenvector columns without materializing dense diagonal matrices.
+            S_sqrt = (Q * L_sqrt.unsqueeze(0)) @ Q.T
+            S_inv_sqrt = (Q * L_inv_sqrt.unsqueeze(0)) @ Q.T
+            return S_sqrt.cpu(), S_inv_sqrt.cpu()
+        except RuntimeError as exc:
+            last_error = exc
+            logger.warning(
+                f"eigh failed for covariance '{label}' on {backend_label}; retrying. Error: {exc}"
+            )
+            if target_device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    raise RuntimeError(
+        f"Failed to compute matrix sqrt/inv_sqrt for covariance '{label}' after CUDA/CPU fallbacks"
+    ) from last_error
 
 
 
@@ -350,7 +393,6 @@ def process_weighted_svd_group(
 
 
 def main(args):
-    setup_file_logger(args.log_path)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     err_T = load_data(args.err_path)
@@ -381,7 +423,9 @@ def main(args):
 
     sqrt_matrices = {}
     for name, cov in tqdm(cov_matrices.items(), desc="Calculating Matrix Square Roots"):
-        sqrt_matrices[name] = calculate_matrix_sqrt_and_inv_sqrt(cov, device)
+        sqrt_matrices[name] = calculate_matrix_sqrt_and_inv_sqrt(
+            cov, device, matrix_name=name
+        )
 
     layer_groups = build_groups(err_T, args.model_name)
 
@@ -496,9 +540,6 @@ if __name__ == "__main__":
         type=float,
         default=0.05,
         help="Alpha for covariance matrix shrinkage.",
-    )
-    p.add_argument(
-        "--log_path", type=str, default="./logs/randomized_gsvd_integrated.log"
     )
 
     args = p.parse_args()

@@ -219,7 +219,7 @@ def main(args):
         f"[MoE usage export] Saved FLAT usage stats for {len(flat_usage)} weights to {args.output_json}"
     )
     print("  (format: { 'model.layers.L.mlp.experts.e.w{1,2,3}.weight': count, ... })")
-    print("  -> step2 --usage_stats_path 에 그대로 넣으면 usage_mode=usage_weighted 로 사용 가능.")
+    print("  -> You can pass this directly to step2 --usage_stats_path and use usage_mode=usage_weighted.")
 
 
 if __name__ == "__main__":
@@ -264,13 +264,13 @@ if __name__ == "__main__":
         "--top_k",
         type=int,
         default=2,
-        help="Top-k experts used per token (Qwen MoE는 보통 2).",
+        help="Top-k experts used per token (Qwen MoE typically uses 2).",
     )
     p.add_argument(
         "--trust_remote_code",
         type=str2bool,
         default=True,
-        help="Qwen MoE는 보통 remote code 필요.",
+        help="Qwen MoE typically requires remote code.",
     )
 
     args = p.parse_args()

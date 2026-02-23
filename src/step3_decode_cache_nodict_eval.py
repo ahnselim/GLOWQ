@@ -626,7 +626,7 @@ def load_eval_corpus(
     elif dataset_key == "hf":
         if hf_name is None:
             raise ValueError(
-                "--eval_dataset hf 를 쓰려면 --eval_hf_name 이 필요합니다."
+                "To use --eval_dataset hf, --eval_hf_name is required."
             )
         ds = load_dataset(hf_name, hf_config, split=split or "test")
         
@@ -876,38 +876,43 @@ def main():
         action="store_true",
         help="Use custom CUDA W4A16 kernels instead of Triton",
     )
+    p.add_argument(
+        "--skip_baseline_eval",
+        action="store_true",
+        help="Skip Wq-only baseline evaluation and print only GlowQ (SVD) results",
+    )
 
     
     p.add_argument(
         "--eval_dataset",
         choices=["wikitext2", "c4", "ptb", "hf"],
         default="wikitext2",
-        help="평가 데이터셋 선택: wikitext2(기본), c4, ptb, 혹은 임의 HF 데이터셋(hf)",
+        help="Evaluation dataset: wikitext2 (default), c4, ptb, or an arbitrary HF dataset (hf)",
     )
     p.add_argument(
-        "--eval_split", default=None, help="평가 split (기본: 데이터셋별 권장값)"
+        "--eval_split", default=None, help="Evaluation split (default: dataset-specific recommended split)"
     )
     p.add_argument(
         "--eval_max_docs",
         type=int,
         default=64,
-        help="문서 최대 개수 제한(메모리/시간 제어용)",
+        help="Maximum number of documents (to control memory/time)",
     )
     p.add_argument(
         "--eval_max_chars",
         type=int,
         default=None,
-        help="문자 수 상한(문서 길이 너무 길 때)",
+        help="Character limit (when documents are too long)",
     )
-    p.add_argument("--eval_seq_len", type=int, default=2048, help="PPL 창 크기(토큰)")
+    p.add_argument("--eval_seq_len", type=int, default=2048, help="PPL window size (tokens)")
     p.add_argument(
-        "--eval_hf_name", default=None, help="--eval_dataset hf 일 때 HF 데이터셋 이름"
+        "--eval_hf_name", default=None, help="HF dataset name when --eval_dataset=hf"
     )
-    p.add_argument("--eval_hf_config", default=None, help="HF config 이름 (필요 시)")
+    p.add_argument("--eval_hf_config", default=None, help="HF config name (if needed)")
     p.add_argument(
         "--eval_text_field",
         default=None,
-        help="텍스트 컬럼명 지정 (자동 탐지 실패 대비)",
+        help="Text column name (fallback if auto-detection fails)",
     )
     args = p.parse_args()
     device = torch.device(args.device)
@@ -927,7 +932,7 @@ def main():
     ]
 
     
-    print(f"📥 Loading original FP16 model for baseline comparison: {args.model_name}")
+    print(f"📥 Loading original FP16 model: {args.model_name}")
     model_fp16 = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         torch_dtype=torch.float16,
@@ -986,55 +991,55 @@ def main():
 
     results = {}
 
-    
-    print("\n=== BASELINE EVALUATION (NO SVD CORRECTION) ===")
-    for module in model.modules():
-        if isinstance(module, AddSVDCorrection):
-            module.alpha_svd = 0.0
-    ppl_base, time_base = evaluate(
-        model,
-        tokenizer,
-        device,
-        f"{method_label} Original Weights ONLY ({args.model_name})",
-        dataset_key=args.eval_dataset,
-        split=args.eval_split,
-        max_docs=args.eval_max_docs,
-        max_chars=args.eval_max_chars,
-        seq_len=args.eval_seq_len,
-        hf_name=args.eval_hf_name,
-        hf_config=args.eval_hf_config,
-        text_field=args.eval_text_field,
-    )
-    gen_metrics_base = None
-    if not args.skip_gen:
-        print(f"Measuring generation metrics for baseline...")
-        try:
-            gen_metrics_base = measure_generation_metrics(
-                model,
-                tokenizer,
-                device,
-                prompts=default_prompts,
-                max_new_tokens=args.gen_max_new_tokens,
-                do_sample=args.gen_do_sample,
-                num_beams=args.gen_num_beams,
-                temperature=args.gen_temperature,
-                top_p=args.gen_top_p,
-                repeats=args.gen_repeats,
-            )
-            print(
-                f"   • Baseline TTFB: {gen_metrics_base['ttfb_ms_median']:.1f}ms (median)"
-            )
-            print(
-                f"   • Baseline Throughput: {gen_metrics_base['tok_s_median']:.2f} tok/s (median)"
-            )
-        except Exception as e:
-            print(f"Generation measurement failed for baseline: {e}")
-            gen_metrics_base = None
-    results["baseline"] = {
-        "ppl": ppl_base,
-        "time": time_base,
-        "generation_metrics": gen_metrics_base,
-    }
+    if not args.skip_baseline_eval:
+        print("\n=== BASELINE EVALUATION (NO SVD CORRECTION) ===")
+        for module in model.modules():
+            if isinstance(module, AddSVDCorrection):
+                module.alpha_svd = 0.0
+        ppl_base, time_base = evaluate(
+            model,
+            tokenizer,
+            device,
+            f"{method_label} Original Weights ONLY ({args.model_name})",
+            dataset_key=args.eval_dataset,
+            split=args.eval_split,
+            max_docs=args.eval_max_docs,
+            max_chars=args.eval_max_chars,
+            seq_len=args.eval_seq_len,
+            hf_name=args.eval_hf_name,
+            hf_config=args.eval_hf_config,
+            text_field=args.eval_text_field,
+        )
+        gen_metrics_base = None
+        if not args.skip_gen:
+            print("Measuring generation metrics for baseline...")
+            try:
+                gen_metrics_base = measure_generation_metrics(
+                    model,
+                    tokenizer,
+                    device,
+                    prompts=default_prompts,
+                    max_new_tokens=args.gen_max_new_tokens,
+                    do_sample=args.gen_do_sample,
+                    num_beams=args.gen_num_beams,
+                    temperature=args.gen_temperature,
+                    top_p=args.gen_top_p,
+                    repeats=args.gen_repeats,
+                )
+                print(
+                    f"   • Baseline TTFB: {gen_metrics_base['ttfb_ms_median']:.1f}ms (median)"
+                )
+                print(
+                    f"   • Baseline Throughput: {gen_metrics_base['tok_s_median']:.2f} tok/s (median)"
+                )
+            except Exception as e:
+                print(f"Generation measurement failed for baseline: {e}")
+                gen_metrics_base = None
+        results["baseline"] = {
+            "ppl": ppl_base,
+            "time": time_base,
+            "generation_metrics": gen_metrics_base,
+        }
 
     
     print("\n=== SVD CORRECTION EVALUATION (ALPHA=1.0) ===")
@@ -1096,13 +1101,14 @@ def main():
     )
     print("-" * 100)
 
-    base = results["baseline"]
-    base_gen = base.get("generation_metrics") or {}
-    base_ttfb = f"{base_gen.get('ttfb_ms_median', 0):.1f}" if base_gen else "-"
-    base_tokps = f"{base_gen.get('tok_s_median', 0):.2f}" if base_gen else "-"
-    print(
-        f"{(method_label + ' (Baseline)'):<50} | {base['ppl']:<10.4f} | {base['time']:<8.2f} | {base_ttfb:<10} | {base_tokps:<10}"
-    )
+    if "baseline" in results:
+        base = results["baseline"]
+        base_gen = base.get("generation_metrics") or {}
+        base_ttfb = f"{base_gen.get('ttfb_ms_median', 0):.1f}" if base_gen else "-"
+        base_tokps = f"{base_gen.get('tok_s_median', 0):.2f}" if base_gen else "-"
+        print(
+            f"{(method_label + ' (Baseline)'):<50} | {base['ppl']:<10.4f} | {base['time']:<8.2f} | {base_ttfb:<10} | {base_tokps:<10}"
+        )
 
     svd = results["svd"]
     svd_gen = svd.get("generation_metrics") or {}

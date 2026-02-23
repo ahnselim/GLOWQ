@@ -1,5 +1,7 @@
 # GlowQ: Group-Shared LOw-Rank Approximation for Quantized LLMs
 
+GlowQ is a low-rank correction method for quantized LLMs that reduces the latency and memory overhead of conventional per-layer restoration by sharing and caching a single right-factor projection across modules that consume the same input (e.g., QKV or MLP groups). GlowQ-S is a selective variant that applies these cached shared corrections only to the groups/layers with the highest accuracy benefit, preserving most of the quality gains while further improving inference efficiency.
+
 ## Installation
 
 Anaconda/Miniconda is recommended.
@@ -73,6 +75,30 @@ export PATH=$CUDA_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 ```
 
+### Using the Custom CUDA W4A16 Kernel (Step3)
+
+GlowQ's W4A16 path uses a custom CUDA extension in `src/cuda_w4a16/` and is built at runtime via `torch.utils.cpp_extension.load(...)` (JIT build). You do not need a separate `setup.py` install step.
+
+To enable it:
+
+1. In your config (`.toml`), set `use_cuda_w4a16 = true`.
+2. Run the pipeline as usual (for example, `python run_glowq.py qwen_2_5_7b.toml`).
+3. On the first run, PyTorch may compile the CUDA extension (this can take time).
+
+Expected Step3 log when enabled:
+
+- `Converting model to CUDA W4A16...`
+
+If the build/import fails:
+
+- Confirm `nvcc --version` works and matches your CUDA/PyTorch environment.
+- Confirm `CUDA_HOME` is set correctly (see example above).
+- Optionally set `TORCH_EXTENSIONS_DIR` to a writable cache directory for extension builds:
+
+```bash
+export TORCH_EXTENSIONS_DIR=/tmp/torch_extensions
+```
+
 ## Pipelines
 
 GlowQ currently provides two pipeline entry points:
@@ -104,7 +130,7 @@ You can also pass only the config filename:
 python run_glowq.py qwen_2_5_7b.toml
 ```
 
-### Restoration Pipeline
+### GlowQ-S Pipeline
 
 `run_glowq_s.py` executes:
 
@@ -140,8 +166,11 @@ Typical fields include:
 - `lm_harness`
 - `device`
 - `group_size`
+- `use_cuda_w4a16`
 - `trust_remote_code`
 - `output_dir`
+
+To use the custom CUDA W4A16 kernel path in Step3, set `use_cuda_w4a16 = true` in your config (TOML). If this is `false`, GlowQ uses the default Triton 4-bit path (or FP16 fallback when Triton is unavailable).
 
 ### LM Harness Mode
 
@@ -170,7 +199,7 @@ logs/
   step2_randomized_gsvd_integrated.log
 ```
 
-### Restoration Pipeline (`run_glowq_s.py`)
+### GlowQ-S Pipeline (`run_glowq_s.py`)
 
 Default output directory:
 
@@ -193,8 +222,6 @@ step4/
   cumulative_results.csv
 step5/
   final_ppl_comparison_plot.png
-logs/
-  restoration_step2_randomized_gsvd.log
 ```
 
 ## Minimal Workflow Example
@@ -215,6 +242,8 @@ python run_glowq_s.py qwen_2_5_7b.toml
 - `lm-eval-harness not available`: install `lm-eval` and set `lm_harness = true` only when needed.
 - CUDA extension build/runtime issues: verify `nvidia-smi`, `nvcc --version`, and PyTorch CUDA compatibility.
 - Hugging Face model loading errors with community models: set `trust_remote_code = true` in the config when required.
+
+## Cite
 
 ```bibtex
 @inproceedings{

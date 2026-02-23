@@ -122,49 +122,49 @@ def is_moe_attn_ffn_related_weight(name: str, tensor: torch.Tensor) -> bool:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="STEP 1 (Qwen1.5-MoE 전용) - FakeQuant 기반 Quantization Error 계산 (Triton 미사용)"
+        description="STEP 1 (Qwen1.5-MoE only) - FakeQuant-based quantization error computation (no Triton)"
     )
     parser.add_argument(
         "--model_name",
         type=str,
         default="Qwen/Qwen1.5-MoE-A2.7B-Chat",
-        help="HF model id (기본: Qwen/Qwen1.5-MoE-A2.7B-Chat, 필요시 변경)",
+        help="HF model id (default: Qwen/Qwen1.5-MoE-A2.7B-Chat; change if needed)",
     )
     parser.add_argument(
         "--out_quant_err",
         type=str,
         required=True,
-        help="양자화 오차(Eq) 딕셔너리를 저장할 .pt 경로",
+        help="Path to save the quantization error (Eq) dictionary (.pt)",
     )
     parser.add_argument(
         "--out_original_weights",
         type=str,
         required=True,
-        help="모델 전체 원본 FP16 state_dict 를 저장할 .pt 경로",
+        help="Path to save the full original FP16 model state_dict (.pt)",
     )
     parser.add_argument(
         "--out_quantized_weights",
         type=str,
         required=False,
-        help="선택된 레이어의 FakeQuant(dequant) Wq 를 저장할 .pt 경로 (옵션)",
+        help="Path to save FakeQuant (dequant) Wq for selected layers (.pt, optional)",
     )
     parser.add_argument(
         "--device",
         type=str,
         default="cuda",
-        help="FakeQuant 연산용 디바이스 (cuda 또는 cpu)",
+        help="Device for FakeQuant operations (cuda or cpu)",
     )
     parser.add_argument(
         "--group_size",
         type=int,
         default=128,
-        help="마지막 차원 기준 group size (기본: 128)",
+        help="Group size along the last dimension (default: 128)",
     )
     parser.add_argument(
         "--num_bits",
         type=int,
         default=4,
-        help="FakeQuant 비트 수 (기본: 4bit)",
+        help="FakeQuant bit width (default: 4-bit)",
     )
     parser.add_argument(
         "--seed",
@@ -175,7 +175,7 @@ def main():
     parser.add_argument(
         "--trust_remote_code",
         action="store_true",
-        help="Qwen 계열 로딩 시 필요하면 설정",
+        help="Set if needed when loading Qwen-family models",
     )
 
     args = parser.parse_args()
@@ -230,7 +230,7 @@ def main():
     print(
         f"🚀 Running FakeQuant (num_bits={args.num_bits}, group_size={args.group_size}) for targeted tensors..."
     )
-    for name in tqdm(targeted_names, desc="FakeQuant & Eq 계산"):
+    for name in tqdm(targeted_names, desc="FakeQuant & Eq"):
         W_cpu = original_state_dict[name]
         W = W_cpu.to(device=device, dtype=torch.float32)
 
@@ -291,10 +291,10 @@ def main():
         print(f"  • Max  |E|:             {max_abs_err:.6f}")
 
     print(
-        "\n✅ DONE. 이 출력(err_dict + fake_quant_weights + original_state_dict)은"
+        "\n✅ DONE. This output (err_dict + fake_quant_weights + original_state_dict)"
     )
-    print("   - 설계 A (uniform E_cat) / 설계 B (usage-weighted E_cat) 모두에서 공통으로 사용 가능.")
-    print("   - Step 2에서 usage π_i만 다르게 반영해서 두 버전을 나누면 됨.")
+    print("   - can be shared across both Design A (uniform E_cat) and Design B (usage-weighted E_cat).")
+    print("   - In Step 2, split into two versions by applying different usage pi_i values.")
 
 
 if __name__ == "__main__":

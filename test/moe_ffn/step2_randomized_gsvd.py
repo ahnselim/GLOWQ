@@ -6,8 +6,6 @@ output :
 |-- low_rank_shared.pt
 `-- b_ref_map.json
 <cov_stats_path> (optional cache .pt)
-./logs/
-`-- randomized_gsvd.log
 """
 
 import os
@@ -34,14 +32,6 @@ formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 ch.setFormatter(formatter)
 if not logger.handlers:
     logger.addHandler(ch)
-
-
-def setup_file_logger(log_path: str):
-    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
-    fh = logging.FileHandler(log_path, mode="w", encoding="utf-8")
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
 
 
 def load_data(path: str) -> Dict[str, torch.Tensor]:
@@ -524,7 +514,6 @@ def get_usage_weight_for_group(
 
 
 def main(args):
-    setup_file_logger(args.log_path)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     usage_stats = load_usage_stats(args.usage_stats_path)
@@ -776,7 +765,6 @@ if __name__ == "__main__":
         default="float32",
         help="Torch dtype name used for XtX accumulation (e.g., float32, float16).",
     )
-    p.add_argument("--log_path", type=str, default="./logs/randomized_gsvd.log")
 
 
     p.add_argument(
@@ -786,7 +774,7 @@ if __name__ == "__main__":
         choices=["uniform", "usage_weighted"],
         help=(
             "How to weight each error matrix within a group: "
-            "'uniform' (설계 A) or 'usage_weighted' (설계 B, requires usage_stats_path)."
+            "'uniform' (Design A) or 'usage_weighted' (Design B, requires usage_stats_path)."
         ),
     )
     p.add_argument(

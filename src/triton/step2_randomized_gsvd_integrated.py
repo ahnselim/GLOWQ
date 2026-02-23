@@ -32,14 +32,6 @@ if not logger.handlers:
     logger.addHandler(ch)
 
 
-def setup_file_logger(log_path: str):
-    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
-    fh = logging.FileHandler(log_path, mode="w", encoding="utf-8")
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
-
-
 def load_data(path: str) -> Dict[str, torch.Tensor]:
     data = torch.load(path, map_location="cpu", weights_only=True)
     logger.info(f"Loaded {len(data)} tensors from {path}")
@@ -165,6 +157,17 @@ def estimate_input_covariance(
             )
             individual_module_data[module_key] = data_list
 
+    total_cov_jobs = sum(
+        1
+        for groups in layer_group_data.values()
+        for data_list in groups.values()
+        if data_list
+    ) + sum(1 for data_list in individual_module_data.values() if data_list)
+    cov_pbar = (
+        tqdm(total=total_cov_jobs, desc="Covariance Shrinkage")
+        if total_cov_jobs > 0
+        else None
+    )
 
     for layer_idx, groups in layer_group_data.items():
         for group_type, data_list in groups.items():
@@ -183,6 +186,8 @@ def estimate_input_covariance(
             else:
                 stable_cov = cov + (1e-6 * torch.eye(d, device=cov.device))
             cov_matrices[group_key] = stable_cov.cpu()
+            if cov_pbar is not None:
+                cov_pbar.update(1)
 
 
     for module_key, data_list in individual_module_data.items():
@@ -197,6 +202,11 @@ def estimate_input_covariance(
         else:
             stable_cov = cov + (1e-6 * torch.eye(d, device=cov.device))
         cov_matrices[module_key] = stable_cov.cpu()
+        if cov_pbar is not None:
+            cov_pbar.update(1)
+
+    if cov_pbar is not None:
+        cov_pbar.close()
 
     logger.info(f"Estimated {len(cov_matrices)} unique covariance matrices.")
     return cov_matrices
@@ -316,7 +326,6 @@ def process_weighted_svd_group(
 
 
 def main(args):
-    setup_file_logger(args.log_path)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     err_T = load_data(args.err_path)
@@ -442,9 +451,6 @@ if __name__ == "__main__":
         type=float,
         default=0.05,
         help="Alpha for covariance matrix shrinkage.",
-    )
-    p.add_argument(
-        "--log_path", type=str, default="./logs/randomized_gsvd_integrated.log"
     )
 
     args = p.parse_args()

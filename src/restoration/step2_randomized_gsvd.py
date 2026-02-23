@@ -5,8 +5,6 @@ output :
 <output_path>/
 |-- low_rank_shared.pt
 `-- b_ref_map.json
-./logs/
-`-- randomized_gsvd_shared_B_streaming.log
 """
 
 import os, re, json, torch, argparse, logging
@@ -27,17 +25,6 @@ formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 ch.setFormatter(formatter)
 if not logger.handlers:
     logger.addHandler(ch)
-
-
-def setup_file_logger(log_path: str):
-    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
-    fh = logging.FileHandler(log_path, mode="w", encoding="utf-8")
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
-
-
-
 
 
 def load_data(path: str) -> Dict[str, torch.Tensor]:
@@ -344,7 +331,6 @@ def process_weighted_svd_group(E_list, Sigma_sqrt, Sigma_inv_sqrt, rank, device)
 
 
 def main(args):
-    setup_file_logger(args.log_path)
     if args.use_tf32:
         torch.set_float32_matmul_precision("high")
         logger.info("TF32/fast matmul enabled (high).")
@@ -499,9 +485,5 @@ if __name__ == "__main__":
     )
     p.add_argument("--oversamples", type=int, default=10)
     p.add_argument("--power_iters", type=int, default=2)
-    p.add_argument(
-        "--log_path", type=str, default="./logs/randomized_gsvd_shared_B_streaming.log"
-    )
     args = p.parse_args()
-    setup_file_logger(args.log_path)
     main(args)

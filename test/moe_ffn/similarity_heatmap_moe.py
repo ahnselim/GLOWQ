@@ -5,8 +5,6 @@ output :
 <fig_out_dir or <output_path>/analysis_figs>/
 |-- {group_key}_crossbasis_{mod_label}_{suffix}.png
 `-- {group_key}_angles_bars_{suffix}.png
-./logs/
-`-- randomized_gsvd_integrated.log
 """
 
 import os
@@ -35,14 +33,6 @@ _formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 _ch.setFormatter(_formatter)
 if not logger.handlers:
     logger.addHandler(_ch)
-
-
-def setup_file_logger(path: str):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    fh = logging.FileHandler(path, mode="w", encoding="utf-8")
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(_formatter)
-    logger.addHandler(fh)
 
 
 def str2bool(x):
@@ -561,13 +551,12 @@ def run_representativeness_analysis(args):
 
 
 def main(args):
-    setup_file_logger(args.log_path)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     _ = device
 
 
     if not args.analysis_only:
-        logger.warning("Decomposition (GSVD) part is not implemented in this script. analysis_only=True 를 사용하세요.")
+        logger.warning("Decomposition (GSVD) part is not implemented in this script. please use analysis_only=True.")
 
     if args.do_analysis != "none":
         os.makedirs(args.fig_out_dir, exist_ok=True)
@@ -620,7 +609,6 @@ if __name__ == "__main__":
     p.add_argument("--fig_out_dir", type=str, default=None)
     p.add_argument("--axis_tick_step", type=int, default=8)
 
-    p.add_argument("--log_path", type=str, default="./logs/randomized_gsvd_integrated.log")
     args = p.parse_args()
     if args.fig_out_dir is None:
         args.fig_out_dir = os.path.join(args.output_path, "analysis_figs")

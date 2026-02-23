@@ -480,7 +480,7 @@ def ensure_dir(path: str):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Step 1 — Compute quantization error (INT2/3/4 + MXFP4/NVFP4/MXFP6, block-FP; MX+/NVFP4 논문식)."
+        description="Step 1 — Compute quantization error (INT2/3/4 + MXFP4/NVFP4/MXFP6, block-FP; MX+/NVFP4 paper-style)."
     )
     ap.add_argument("--model_name", type=str, required=True,
                     help="HF model id (e.g., mistralai/Mistral-7B-v0.3)")
@@ -490,10 +490,10 @@ def main():
                     default="int4",
                     help="Quantization datatype/precision.")
     ap.add_argument("--bits", type=int, choices=[2, 3, 4], default=None,
-                    help="(호환용) 제공 시 quant_dtype를 int{bits}로 강제.")
+                    help="(Compatibility) If provided, force quant_dtype to int{bits}.")
     ap.add_argument("--group_size", type=int, default=128,
-                    help="Per-group size (INT系 및 block-FP 계열 모두 사용; "
-                         "MXFP4/MXFP6는 보통 32, NVFP4는 16 권장).")
+                    help="Per-group size (used for both INT-family and block-FP formats; "
+                         "MXFP4/MXFP6 typically use 32, and 16 is recommended for NVFP4).")
     ap.add_argument("--device", type=str, default="cuda", help="Compute device for per-layer ops (cuda|cpu)")
     ap.add_argument("--trust_remote_code", action="store_true", help="Required for some Qwen/others")
     ap.add_argument("--out_quant_err", required=True, help="Path to save error dict (.pt)")

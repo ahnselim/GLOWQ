@@ -757,7 +757,7 @@ def run_lm_harness(
     device,
 ):
     if not LM_HARNESS_AVAILABLE:
-        print("⚠️ lm-eval-harness 미설치. 건너뜀")
+        print("⚠️ lm-eval-harness not installed. Skipping")
         return {}
 
     model.eval()
@@ -786,7 +786,7 @@ def run_lm_harness(
             limit=limit,
         )
     except torch.cuda.OutOfMemoryError:
-        print("💥 CUDA OOM → batch_size=1, max_length=1024로 재시도")
+        print("💥 CUDA OOM -> retrying with batch_size=1, max_length=1024")
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         hf_model = HFLM(
@@ -806,7 +806,7 @@ def run_lm_harness(
                 limit=min(100, limit) if isinstance(limit, int) else limit,
             )
         except Exception as exc:
-            print(f"❌ Harness 재시도 실패: {exc}")
+            print(f"❌ Harness retry failed: {exc}")
             return {}
 
 
@@ -905,6 +905,11 @@ def main():
         help="Use custom CUDA W4A16 kernels instead of Triton",
     )
     p.add_argument(
+        "--skip_baseline_eval",
+        action="store_true",
+        help="Skip Wq-only baseline evaluation and print only GlowQ (SVD) results",
+    )
+    p.add_argument(
         "--enable_harness",
         action="store_true",
         help="Run lm-eval-harness (zero-shot) for downstream benchmarks",
@@ -958,7 +963,7 @@ def main():
         "The quick brown fox",
         "In a shocking finding, scientists discovered that",
     ]
-    print(f"📥 Loading original FP16 model for baseline comparison: {args.model_name}")
+    print(f"📥 Loading original FP16 model: {args.model_name}")
     model_fp16 = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         torch_dtype=torch.float16,
@@ -1002,45 +1007,45 @@ def main():
             if isinstance(module, AddSVDCorrection):
                 module.alpha_svd = value
 
-    
-    print("\n=== BASELINE EVALUATION (NO SVD CORRECTION) ===")
-    set_svd_alpha(0.0)
-    ppl_base, time_base = evaluate(
-        model,
-        tokenizer,
-        device,
-        f"{method_label} Original Weights ONLY ({args.model_name})",
-    )
-    gen_metrics_base = None
-    if not args.skip_gen:
-        print(f"Measuring generation metrics for baseline...")
-        try:
-            gen_metrics_base = measure_generation_metrics(
-                model,
-                tokenizer,
-                device,
-                prompts=default_prompts,
-                max_new_tokens=args.gen_max_new_tokens,
-                do_sample=args.gen_do_sample,
-                num_beams=args.gen_num_beams,
-                temperature=args.gen_temperature,
-                top_p=args.gen_top_p,
-                repeats=args.gen_repeats,
-            )
-            print(
-                f"   • Baseline TTFB: {gen_metrics_base['ttfb_ms_median']:.1f}ms (median)"
-            )
-            print(
-                f"   • Baseline Throughput: {gen_metrics_base['tok_s_median']:.2f} tok/s (median)"
-            )
-        except Exception as e:
-            print(f"Generation measurement failed for baseline: {e}")
-            gen_metrics_base = None
-    results["baseline"] = {
-        "ppl": ppl_base,
-        "time": time_base,
-        "generation_metrics": gen_metrics_base,
-    }
+    if not args.skip_baseline_eval:
+        print("\n=== BASELINE EVALUATION (NO SVD CORRECTION) ===")
+        set_svd_alpha(0.0)
+        ppl_base, time_base = evaluate(
+            model,
+            tokenizer,
+            device,
+            f"{method_label} Original Weights ONLY ({args.model_name})",
+        )
+        gen_metrics_base = None
+        if not args.skip_gen:
+            print("Measuring generation metrics for baseline...")
+            try:
+                gen_metrics_base = measure_generation_metrics(
+                    model,
+                    tokenizer,
+                    device,
+                    prompts=default_prompts,
+                    max_new_tokens=args.gen_max_new_tokens,
+                    do_sample=args.gen_do_sample,
+                    num_beams=args.gen_num_beams,
+                    temperature=args.gen_temperature,
+                    top_p=args.gen_top_p,
+                    repeats=args.gen_repeats,
+                )
+                print(
+                    f"   • Baseline TTFB: {gen_metrics_base['ttfb_ms_median']:.1f}ms (median)"
+                )
+                print(
+                    f"   • Baseline Throughput: {gen_metrics_base['tok_s_median']:.2f} tok/s (median)"
+                )
+            except Exception as e:
+                print(f"Generation measurement failed for baseline: {e}")
+                gen_metrics_base = None
+        results["baseline"] = {
+            "ppl": ppl_base,
+            "time": time_base,
+            "generation_metrics": gen_metrics_base,
+        }
 
     
     print("\n=== SVD CORRECTION EVALUATION (ALPHA=1.0) ===")
@@ -1084,17 +1089,17 @@ def main():
         tasks = [t.strip() for t in args.harness_tasks.split(",") if t.strip()]
         if not tasks:
             tasks = ["arc_easy", "piqa", "boolq"]
-        print("\n🎯 LM Harness 평가 시작 (zero-shot)...")
+        print("\n🎯 Starting LM Harness evaluation (zero-shot)...")
 
         def maybe_clear_cache():
             if args.clear_cache_before_harness and torch.cuda.is_available():
-                print("🧹 CUDA 캐시 정리...")
+                print("🧹 Clearing CUDA cache...")
                 torch.cuda.empty_cache()
 
         def print_harness_summary(label, data):
-            print(f"\n[{label}] Harness 결과")
+            print(f"\n[{label}] Harness results")
             if not data or "results" not in data:
-                print("   (결과 없음)")
+                print("   (No results)")
                 return
             print(_make_harness_table(data))
             acc_values = []
@@ -1110,20 +1115,21 @@ def main():
 
         harness_payload = {}
 
-        maybe_clear_cache()
-        set_svd_alpha(0.0)
-        baseline_harness = run_lm_harness(
-            model=model,
-            tokenizer=tokenizer,
-            tasks=tasks,
-            batch_size=args.harness_batch_size,
-            num_fewshot=args.harness_num_fewshot,
-            limit=args.harness_limit,
-            device=args.device,
-        )
-        results["baseline"]["harness"] = baseline_harness
-        harness_payload["baseline"] = baseline_harness
-        print_harness_summary("Baseline (α=0.0)", baseline_harness)
+        if not args.skip_baseline_eval:
+            maybe_clear_cache()
+            set_svd_alpha(0.0)
+            baseline_harness = run_lm_harness(
+                model=model,
+                tokenizer=tokenizer,
+                tasks=tasks,
+                batch_size=args.harness_batch_size,
+                num_fewshot=args.harness_num_fewshot,
+                limit=args.harness_limit,
+                device=args.device,
+            )
+            results["baseline"]["harness"] = baseline_harness
+            harness_payload["baseline"] = baseline_harness
+            print_harness_summary("Baseline (α=0.0)", baseline_harness)
 
         maybe_clear_cache()
         set_svd_alpha(1.0)
@@ -1144,9 +1150,9 @@ def main():
             try:
                 with open(args.save_harness_results, "w") as f:
                     json.dump(_sanitize_for_json(harness_payload), f, indent=2)
-                print(f"📄 Harness 결과 저장: {args.save_harness_results}")
+                print(f"📄 Saved Harness results: {args.save_harness_results}")
             except Exception as exc:
-                print(f"⚠️ Harness 결과 저장 실패: {exc}")
+                print(f"⚠️ Failed to save Harness results: {exc}")
 
         set_svd_alpha(1.0)
 

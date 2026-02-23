@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import importlib
+import os
 import sys
 from pathlib import Path
 
@@ -16,6 +17,36 @@ except ModuleNotFoundError:  # pragma: no cover
 ROOT_DIR = Path(__file__).resolve().parent
 SRC_DIR = ROOT_DIR / "src"
 CONFIG_DIR = ROOT_DIR / "configs"
+
+ANSI_RESET = "\033[0m"
+STEP_COLORS = {
+    "step1": "\033[38;5;213m",  # pink
+    "step2": "\033[38;5;208m",  # orange
+    "step3": "\033[38;5;117m",  # sky blue
+}
+
+
+class _ColorizedStream:
+    def __init__(self, stream, color_code: str):
+        self._stream = stream
+        self._color_code = color_code
+
+    def write(self, text):
+        if not text:
+            return 0
+        return self._stream.write(f"{self._color_code}{text}{ANSI_RESET}")
+
+    def flush(self):
+        return self._stream.flush()
+
+    def isatty(self):
+        try:
+            return self._stream.isatty()
+        except Exception:
+            return False
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
 
 
 def _load_toml(path: Path) -> dict:
@@ -93,6 +124,33 @@ def _temporary_argv(argv: list[str]):
         sys.argv = old_argv
 
 
+def _should_use_color(stream) -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    try:
+        return stream.isatty()
+    except Exception:
+        return False
+
+
+@contextlib.contextmanager
+def _step_color_output(step_name: str):
+    color = STEP_COLORS.get(step_name)
+    if not color or (not _should_use_color(sys.stdout) and not _should_use_color(sys.stderr)):
+        yield
+        return
+
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+    sys.stdout = _ColorizedStream(old_stdout, color)
+    sys.stderr = _ColorizedStream(old_stderr, color)
+    try:
+        yield
+    finally:
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+
+
 def _import_src_module(module_name: str):
     _ensure_src_on_path()
     return importlib.import_module(module_name)
@@ -106,20 +164,16 @@ def _append_flag(argv: list[str], enabled: bool, flag: str):
 def _build_run_paths(run_root: Path) -> dict[str, Path]:
     step1_dir = run_root / "step1"
     step2_dir = run_root / "step2"
-    logs_dir = run_root / "logs"
     step1_dir.mkdir(parents=True, exist_ok=True)
     step2_dir.mkdir(parents=True, exist_ok=True)
-    logs_dir.mkdir(parents=True, exist_ok=True)
     return {
         "run_root": run_root,
         "step1_dir": step1_dir,
         "step2_dir": step2_dir,
-        "logs_dir": logs_dir,
         "quant_err_path": step1_dir / "quant_error.pt",
         "original_weights_path": step1_dir / "original_weights.pt",
         "shared_path": step2_dir / "low_rank_shared.pt",
         "bmap_path": step2_dir / "b_ref_map.json",
-        "step2_log_path": logs_dir / "step2_randomized_gsvd_integrated.log",
     }
 
 
@@ -139,54 +193,55 @@ def _normalize_ppl_dataset(dataset_key: str) -> str:
 
 
 def run_step1(cfg: dict, paths: dict[str, Path]) -> None:
-    step1 = _import_src_module("step1_quantize_error_integrated")
-    argv = [
-        "step1_quantize_error_integrated.py",
-        "--model_name",
-        str(_require(cfg, "model_name")),
-        "--out_quant_err",
-        str(paths["quant_err_path"]),
-        "--out_original_weights",
-        str(paths["original_weights_path"]),
-        "--device",
-        str(_cfg_get(cfg, "device", "cuda")),
-        "--group_size",
-        str(int(_cfg_get(cfg, "group_size", 128))),
-        "--seed",
-        str(int(_cfg_get(cfg, "seed", 42))),
-    ]
-    _append_flag(argv, bool(_cfg_get(cfg, "trust_remote_code", False)), "--trust_remote_code")
+    with _step_color_output("step1"):
+        step1 = _import_src_module("step1_quantize_error_integrated")
+        argv = [
+            "step1_quantize_error_integrated.py",
+            "--model_name",
+            str(_require(cfg, "model_name")),
+            "--out_quant_err",
+            str(paths["quant_err_path"]),
+            "--out_original_weights",
+            str(paths["original_weights_path"]),
+            "--device",
+            str(_cfg_get(cfg, "device", "cuda")),
+            "--group_size",
+            str(int(_cfg_get(cfg, "group_size", 128))),
+            "--seed",
+            str(int(_cfg_get(cfg, "seed", 42))),
+        ]
+        _append_flag(argv, bool(_cfg_get(cfg, "trust_remote_code", False)), "--trust_remote_code")
 
-    print("\n[GlowQ] Step1 start: quantization error extraction")
-    print(f"[GlowQ] Step1 outputs: {paths['quant_err_path']}, {paths['original_weights_path']}")
-    with _temporary_argv(argv):
-        step1.main()
-    print("[GlowQ] Step1 done")
+        print("\n[GlowQ] Step1 start: quantization error extraction")
+        print(f"[GlowQ] Step1 outputs: {paths['quant_err_path']}, {paths['original_weights_path']}")
+        with _temporary_argv(argv):
+            step1.main()
+        print("[GlowQ] Step1 done")
 
 
 def run_step2(cfg: dict, paths: dict[str, Path]) -> None:
-    step2 = _import_src_module("step2_randomized_gsvd_integrated")
-    args = argparse.Namespace(
-        model_name=str(_require(cfg, "model_name")),
-        err_path=str(paths["quant_err_path"]),
-        output_path=str(paths["step2_dir"]),
-        trust_remote_code=bool(_cfg_get(cfg, "trust_remote_code", False)),
-        max_rank=int(_require(cfg, "svd_rank")),
-        nsamples=int(_require(cfg, "calibration_n_samples")),
-        calibration_dataset=str(
-            _cfg_get(cfg, "calibration_dataset", "DKYoon/SlimPajama-6B")
-        ),
-        seqlen=int(_cfg_get(cfg, "calibration_seq_len", 2048)),
-        shrinkage_alpha=float(_cfg_get(cfg, "shrinkage_alpha", 0.05)),
-        log_path=str(paths["step2_log_path"]),
-    )
+    with _step_color_output("step2"):
+        step2 = _import_src_module("step2_randomized_gsvd_integrated")
+        args = argparse.Namespace(
+            model_name=str(_require(cfg, "model_name")),
+            err_path=str(paths["quant_err_path"]),
+            output_path=str(paths["step2_dir"]),
+            trust_remote_code=bool(_cfg_get(cfg, "trust_remote_code", False)),
+            max_rank=int(_require(cfg, "svd_rank")),
+            nsamples=int(_require(cfg, "calibration_n_samples")),
+            calibration_dataset=str(
+                _cfg_get(cfg, "calibration_dataset", "DKYoon/SlimPajama-6B")
+            ),
+            seqlen=int(_cfg_get(cfg, "calibration_seq_len", 2048)),
+            shrinkage_alpha=float(_cfg_get(cfg, "shrinkage_alpha", 0.05)),
+        )
 
-    print("\n[GlowQ] Step2 start: randomized GSVD")
-    print(
-        f"[GlowQ] Step2 config: rank={args.max_rank}, calib_dataset={args.calibration_dataset}, nsamples={args.nsamples}"
-    )
-    step2.main(args)
-    print("[GlowQ] Step2 done")
+        print("\n[GlowQ] Step2 start: randomized GSVD")
+        print(
+            f"[GlowQ] Step2 config: rank={args.max_rank}, calib_dataset={args.calibration_dataset}, nsamples={args.nsamples}"
+        )
+        step2.main(args)
+        print("[GlowQ] Step2 done")
 
 
 def run_step3(cfg: dict, paths: dict[str, Path]) -> None:
@@ -212,25 +267,62 @@ def run_step3(cfg: dict, paths: dict[str, Path]) -> None:
         "--group_size",
         str(group_size),
     ]
+    # run_glowq.py focuses on final GlowQ results; skip Wq-only baseline measurement/output.
+    common_argv.append("--skip_baseline_eval")
     if trust_remote_code:
         common_argv.append("--trust_remote_code")
     if use_cuda_w4a16:
         common_argv.append("--use_cuda_w4a16")
 
-    if lm_harness:
-        if _normalize_ppl_dataset(ppl_dataset) != "wikitext2":
-            print(
-                f"[GlowQ] Note: lm_harness=true uses step3_decode_cache_lm.py (built-in PPL eval); ppl_dataset='{ppl_dataset}' is ignored in this mode."
-            )
-        step3_lm = _import_src_module("step3_decode_cache_lm")
-        argv = ["step3_decode_cache_lm.py", *common_argv, "--enable_harness"]
+    with _step_color_output("step3"):
+        if lm_harness:
+            if _normalize_ppl_dataset(ppl_dataset) != "wikitext2":
+                print(
+                    f"[GlowQ] Note: lm_harness=true uses step3_decode_cache_lm.py (built-in PPL eval); ppl_dataset='{ppl_dataset}' is ignored in this mode."
+                )
+            step3_lm = _import_src_module("step3_decode_cache_lm")
+            argv = ["step3_decode_cache_lm.py", *common_argv, "--enable_harness"]
+
+            if bool(_cfg_get(cfg, "skip_gen", False)):
+                argv.append("--skip_gen")
+            for key, flag in (
+                ("gen_do_sample", "--gen_do_sample"),
+                ("clear_cache_before_harness", "--clear_cache_before_harness"),
+            ):
+                _append_flag(argv, bool(_cfg_get(cfg, key, False)), flag)
+            for key in (
+                "gen_max_new_tokens",
+                "gen_repeats",
+                "gen_num_beams",
+                "gen_temperature",
+                "gen_top_p",
+                "harness_tasks",
+                "harness_batch_size",
+                "harness_num_fewshot",
+                "harness_limit",
+                "save_harness_results",
+            ):
+                value = _cfg_get(cfg, key, None)
+                if value is not None:
+                    argv.extend([f"--{key}", str(value)])
+
+            print("\n[GlowQ] Step3 start: step3_decode_cache_lm.py (lm-eval-harness enabled)")
+            with _temporary_argv(argv):
+                step3_lm.main()
+            print("[GlowQ] Step3 done")
+            return
+
+        step3_eval = _import_src_module("step3_decode_cache_nodict_eval")
+        argv = [
+            "step3_decode_cache_nodict_eval.py",
+            *common_argv,
+            "--eval_dataset",
+            _normalize_ppl_dataset(ppl_dataset),
+        ]
 
         if bool(_cfg_get(cfg, "skip_gen", False)):
             argv.append("--skip_gen")
-        for key, flag in (
-            ("gen_do_sample", "--gen_do_sample"),
-            ("clear_cache_before_harness", "--clear_cache_before_harness"),
-        ):
+        for key, flag in (("gen_do_sample", "--gen_do_sample"),):
             _append_flag(argv, bool(_cfg_get(cfg, key, False)), flag)
         for key in (
             "gen_max_new_tokens",
@@ -238,58 +330,24 @@ def run_step3(cfg: dict, paths: dict[str, Path]) -> None:
             "gen_num_beams",
             "gen_temperature",
             "gen_top_p",
-            "harness_tasks",
-            "harness_batch_size",
-            "harness_num_fewshot",
-            "harness_limit",
-            "save_harness_results",
+            "eval_split",
+            "eval_max_docs",
+            "eval_max_chars",
+            "eval_seq_len",
+            "eval_hf_name",
+            "eval_hf_config",
+            "eval_text_field",
         ):
             value = _cfg_get(cfg, key, None)
             if value is not None:
                 argv.extend([f"--{key}", str(value)])
 
-        print("\n[GlowQ] Step3 start: step3_decode_cache_lm.py (lm-eval-harness enabled)")
+        print(
+            f"\n[GlowQ] Step3 start: step3_decode_cache_nodict_eval.py (ppl_dataset={ppl_dataset})"
+        )
         with _temporary_argv(argv):
-            step3_lm.main()
+            step3_eval.main()
         print("[GlowQ] Step3 done")
-        return
-
-    step3_eval = _import_src_module("step3_decode_cache_nodict_eval")
-    argv = [
-        "step3_decode_cache_nodict_eval.py",
-        *common_argv,
-        "--eval_dataset",
-        _normalize_ppl_dataset(ppl_dataset),
-    ]
-
-    if bool(_cfg_get(cfg, "skip_gen", False)):
-        argv.append("--skip_gen")
-    for key, flag in (("gen_do_sample", "--gen_do_sample"),):
-        _append_flag(argv, bool(_cfg_get(cfg, key, False)), flag)
-    for key in (
-        "gen_max_new_tokens",
-        "gen_repeats",
-        "gen_num_beams",
-        "gen_temperature",
-        "gen_top_p",
-        "eval_split",
-        "eval_max_docs",
-        "eval_max_chars",
-        "eval_seq_len",
-        "eval_hf_name",
-        "eval_hf_config",
-        "eval_text_field",
-    ):
-        value = _cfg_get(cfg, key, None)
-        if value is not None:
-            argv.extend([f"--{key}", str(value)])
-
-    print(
-        f"\n[GlowQ] Step3 start: step3_decode_cache_nodict_eval.py (ppl_dataset={ppl_dataset})"
-    )
-    with _temporary_argv(argv):
-        step3_eval.main()
-    print("[GlowQ] Step3 done")
 
 
 def main():

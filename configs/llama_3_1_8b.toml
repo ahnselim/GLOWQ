@@ -15,6 +15,7 @@ lm_harness = false
 # Optional runtime settings
 device = "cuda:0"
 group_size = 128
+use_cuda_w4a16 = false
 trust_remote_code = false
 calibration_seq_len = 2048
 output_dir = "outputs/llama_3_1_8b"

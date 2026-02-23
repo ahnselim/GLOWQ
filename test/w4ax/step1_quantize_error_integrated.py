@@ -439,18 +439,6 @@ def main():
         processed_layers += 1
 
 
-        original_norm = W_original.norm().item()
-        quantized_norm = Wq.norm().item()
-        error_norm = Eq.norm().item()
-        error_ratio = error_norm / max(original_norm, 1e-12)
-
-        print(f"  Layer: {name}")
-        print(
-            f"    Shape: {W_original_cpu.shape}, Original norm: {original_norm:.4f}, Quantized norm: {quantized_norm:.4f}"
-        )
-        print(f"    Error norm: {error_norm:.4f}, Error ratio: {error_ratio:.4f}")
-
-
     print(f"\n🔍 Discovered Layer Dimensions for {args.model_name} (First 3 layers):")
     for layer_num in sorted(layer_dimensions.keys())[:3]:
         print(f"  Layer {layer_num}:")

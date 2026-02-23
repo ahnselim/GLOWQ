@@ -6,8 +6,6 @@ output :
 |-- low_rank_layerwise.pt
 `-- b_ref_map_layerwise.json
 <cov_stats_path> (optional cache .pt)
-./logs/
-`-- randomized_gsvd_layerwise_streaming.log
 """
 
 import os, re, json, torch, argparse, logging
@@ -35,17 +33,6 @@ formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 ch.setFormatter(formatter)
 if not logger.handlers:
     logger.addHandler(ch)
-
-
-def setup_file_logger(log_path: str):
-    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
-    fh = logging.FileHandler(log_path, mode="w", encoding="utf-8")
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
-
-
-
 
 
 def load_data(path: str) -> Dict[str, torch.Tensor]:
@@ -297,7 +284,6 @@ def process_weighted_svd(E, Sigma_sqrt, Sigma_inv_sqrt, rank, device):
 
 
 def main(args):
-    setup_file_logger(args.log_path)
     if args.use_tf32:
         torch.set_float32_matmul_precision("high")
         logger.info("TF32/fast matmul enabled (high).")
@@ -478,9 +464,5 @@ if __name__ == "__main__":
         default=False,
         help="If true and stats exist at --cov_stats_path, reuse instead of recomputing.",
     )
-    p.add_argument(
-        "--log_path", type=str, default="./logs/randomized_gsvd_layerwise_streaming.log"
-    )
     args = p.parse_args()
-    setup_file_logger(args.log_path)
     main(args)

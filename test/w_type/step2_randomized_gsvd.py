@@ -11,8 +11,6 @@ output :
     `-- fig_ccdf_loglog_<group>.png
 <analysis_out_dir> (used instead of <output_path>/analysis when provided)
 <cov_stats_path> (optional cache .pt)
-./logs/
-`-- step2_randomized_gsvd.log
 """
 
 import os
@@ -46,14 +44,6 @@ formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 ch.setFormatter(formatter)
 if not logger.handlers:
     logger.addHandler(ch)
-
-
-def setup_file_logger(log_path: str):
-    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
-    fh = logging.FileHandler(log_path, mode="w", encoding="utf-8")
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
 
 
 def load_data(path: str) -> Dict[str, torch.Tensor]:
@@ -634,7 +624,6 @@ def run_error_stats_and_plots(
 
 
 def main(args):
-    setup_file_logger(args.log_path)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
@@ -647,7 +636,7 @@ def main(args):
         label_to_err[main_label] = err_T_main
         if args.compare_err_paths:
             if args.compare_labels and len(args.compare_labels) != len(args.compare_err_paths):
-                raise ValueError("--compare_labels 개수는 --compare_err_paths 개수와 동일해야 합니다.")
+                raise ValueError("--compare_labels count must match --compare_err_paths count.")
             for i, pth in enumerate(args.compare_err_paths):
                 lab = args.compare_labels[i] if args.compare_labels else f"ERR{i+1}"
                 label_to_err[lab] = load_data(pth)
@@ -819,7 +808,6 @@ if __name__ == "__main__":
     p.add_argument("--matmul_dtype", type=str, default="float32", help="Torch dtype for XtX accumulation.")
 
 
-    p.add_argument("--log_path", type=str, default="./logs/step2_randomized_gsvd.log")
 
 
     p.add_argument("--analysis", action="store_true", help="Run empirical error statistics & scaling-law plots.")
