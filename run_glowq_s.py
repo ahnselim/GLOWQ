@@ -173,9 +173,9 @@ def _build_paths(cfg: dict, config_stem: str) -> dict[str, Path]:
 
 def run_step1(cfg: dict, paths: dict[str, Path]) -> None:
     with _step_color_output("step1"):
-        mod = _import_src_module("step1_quantize_error_integrated")
+        mod = _import_src_module("step1_quantize")
         argv = [
-            "step1_quantize_error_integrated.py",
+            "step1_quantize.py",
             "--model_name",
             str(_require(cfg, "model_name")),
             "--out_quant_err",
@@ -200,7 +200,7 @@ def run_step1(cfg: dict, paths: dict[str, Path]) -> None:
 
 def run_step2(cfg: dict, paths: dict[str, Path]) -> None:
     with _step_color_output("step2"):
-        mod = _import_src_module("step2_randomized_gsvd_integrated")
+        mod = _import_src_module("step2_rsvd")
         cov_stats_path = _cfg_get(
             cfg,
             "restoration_cov_stats_path",

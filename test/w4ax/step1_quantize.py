@@ -1,10 +1,11 @@
 """
-src/step1_quantize_error_integrated.py
-Computes integrated Triton 4-bit quantization error tensors from original weights and saves artifacts for downstream correction.
+w4ax/step1_quantize.py
+Computes integrated quantization error tensors for W4Ax experiments using Triton-based fake quantization.
 output :
 (user-specified output paths)
 |-- <out_quant_err>           (.pt)
-`-- <out_original_weights>    (.pt)
+|-- <out_original_weights>    (.pt)
+`-- <out_quantized_weights>   (.pt, optional)
 """
 
 import os, gc, re, torch, argparse, math
@@ -102,7 +103,7 @@ if HAS_TRITON:
                     is_low_zero_nibble[:, None], packed_zeros & 0x0F, packed_zeros >> 4
                 )
             else:
-                zeros = 8  
+                zeros = 8
 
             dequant_weights = (
                 nibbles.to(tl.float32) - zeros.to(tl.float32)
@@ -332,6 +333,11 @@ def main():
         help="Output path for original weights dictionary (.pt)",
     )
     ap.add_argument(
+        "--out_quantized_weights",
+        required=False,
+        help="Optional output path for fake-quant (dequantized) weights (.pt)",
+    )
+    ap.add_argument(
         "--trust_remote_code",
         action="store_true",
         help="Set this flag for models like Qwen that require custom code",
@@ -371,11 +377,12 @@ def main():
         "Note: This script automatically detects layer dimensions, supporting heterogeneous attention."
     )
 
-    
+
     original_state_dict = {
         k: v.cpu().clone() for k, v in model_fp16.state_dict().items()
     }
     quant_err_dict = {}
+    quantized_weight_dict = {} if args.out_quantized_weights else None
 
     print(
         f"\nCalculating quantization errors from ORIGINAL weights using Asymmetric Triton..."
@@ -393,7 +400,7 @@ def main():
         ):
             continue
 
-        
+
         if not any(
             kw in name
             for kw in [
@@ -402,16 +409,16 @@ def main():
                 "v_proj",
                 "o_proj",
                 "out_proj",
-                "fc1",
-                "fc2",
                 "gate_proj",
                 "up_proj",
                 "down_proj",
+                "fc1",
+                "fc2",
             ]
         ):
             continue
 
-        
+
         layer_idx_match = re.search(r"layers\.(\d+)\.", name)
         if layer_idx_match:
             layer_num = layer_idx_match.group(1)
@@ -423,12 +430,15 @@ def main():
         W_original = W_original_cpu.to(device)
         Wq = get_triton_dequantized_weight(W_original, device, args.group_size)
 
-        Eq = W_original.cpu() - Wq.cpu()
-        quant_err_dict[name] = Eq.to(torch.float32)  
+        Wq_cpu = Wq.cpu()
+        Eq = W_original.cpu() - Wq_cpu
+        quant_err_dict[name] = Eq.to(torch.float32)
+        if quantized_weight_dict is not None:
+            quantized_weight_dict[name] = Wq_cpu.to(torch.float16).contiguous()
 
         processed_layers += 1
 
-        
+
     print(f"\n🔍 Discovered Layer Dimensions for {args.model_name} (First 3 layers):")
     for layer_num in sorted(layer_dimensions.keys())[:3]:
         print(f"  Layer {layer_num}:")
@@ -439,21 +449,27 @@ def main():
     gc.collect()
     torch.cuda.empty_cache()
 
-    
+
     os.makedirs(os.path.dirname(args.out_quant_err) or ".", exist_ok=True)
     os.makedirs(os.path.dirname(args.out_original_weights) or ".", exist_ok=True)
+    if args.out_quantized_weights:
+        os.makedirs(os.path.dirname(args.out_quantized_weights) or ".", exist_ok=True)
     torch.save(quant_err_dict, args.out_quant_err)
     torch.save(original_state_dict, args.out_original_weights)
+    if args.out_quantized_weights:
+        torch.save(quantized_weight_dict, args.out_quantized_weights)
 
     print(f"\nCOMPLETED: Files saved!")
     print(f"  Quantization errors: {args.out_quant_err}")
     print(f"  Original weights: {args.out_original_weights}")
+    if args.out_quantized_weights:
+        print(f"  Fake-quant weights: {args.out_quantized_weights}")
     print(f"  Processed layers: {processed_layers}")
     print(
         f"  Configuration: Model='{args.model_name}', group_size={args.group_size}, seed={args.seed}"
     )
 
-    
+
     if quant_err_dict:
         total_error_elements = sum(tensor.numel() for tensor in quant_err_dict.values())
         avg_error_magnitude = (

@@ -1,5 +1,5 @@
 """
-moe_ffn/step2_randomized_gsvd.py
+moe_ffn/step2_rsvd.py
 Performs integrated randomized GSVD with usage-aware Shared-B grouping for MoE FFN quantization errors.
 output :
 <output_path>/

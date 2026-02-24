@@ -1,10 +1,12 @@
 """
-src/step3_decode_cache_nodict_eval.py
-Evaluates dict-free decode-cache SVD correction on selectable datasets with PPL and generation metrics.
+src/step3_lm_eval.py
+Evaluates dict-free decode-cache SVD correction with PPL/generation metrics and optional lm-eval-harness benchmarks.
 output :
-(stdout only)
-|-- Baseline metrics         (PPL, timing, generation metrics)
-`-- SVD-corrected metrics    (PPL, timing, generation metrics)
+(stdout only by default)
+|-- Baseline vs SVD metrics      (PPL, timing, generation metrics)
+`-- LM Harness summaries         (when --enable_harness)
+(optional)
+`-- <save_harness_results>       (.json)
 """
 
 import argparse, json, torch, torch.nn as nn, torch.nn.functional as F, math, gc, os, time, re, sys
@@ -15,6 +17,25 @@ from typing import Optional
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
+
+
+
+
+try:
+    from lm_eval import evaluator
+    from lm_eval.models.huggingface import HFLM
+
+    LM_HARNESS_AVAILABLE = True
+except Exception:
+    LM_HARNESS_AVAILABLE = False
+    print("⚠️ lm-eval-harness not available. pip install lm-eval")
+
+try:
+    import numpy as _np
+
+    _HAS_NUMPY = True
+except Exception:
+    _HAS_NUMPY = False
 
 
 
@@ -72,20 +93,6 @@ def _configure_cuda_w4a16_env(args) -> None:
         f", dequant_chunk={os.environ.get('W4A16_DEQUANT_CHUNK', '(default)')}"
         f", dequant_cache={os.environ.get('W4A16_DEQUANT_CACHE', '0')}"
     )
-
-
-def _safe_cuda_empty_cache(context: str) -> bool:
-    if not torch.cuda.is_available():
-        return True
-    try:
-        torch.cuda.empty_cache()
-        return True
-    except Exception as exc:
-        print(
-            f"[WARN] torch.cuda.empty_cache() failed during {context}; continuing without cache clear. Error: {exc}"
-        )
-        return False
-
 
 if HAS_TRITON:
 
@@ -348,7 +355,7 @@ if HAS_TRITON:
                 new_module = TritonTrue4BitLinear.from_float(module, group_size)
                 setattr(parent, attr_name, new_module)
         gc.collect()
-        _safe_cuda_empty_cache("convert_to_triton_4bit")
+        torch.cuda.empty_cache()
         return model
 
 
@@ -399,8 +406,6 @@ def get_parent_module(model, name):
     for part in parts[:-1]:
         parent = getattr(parent, part)
     return parent, parts[-1]
-
-
 
 
 
@@ -550,7 +555,7 @@ def patch_svd_correction_wrappers(model, shared, bmap, alpha_svd=1.0):
             cache = gkey2cache.setdefault(gkey, MiniGroupCache())
         else:
             
-            if m := re.match(r"(model\\.layers\\.\\d+\\..*?)\\.B", bkey):
+            if m := re.match(r"(model\.layers\.\d+\..*?)\.B", bkey):
                 gkey = m.group(1)
             else:
                 gkey = bkey.replace(".B", "")
@@ -574,9 +579,7 @@ def patch_svd_correction_wrappers(model, shared, bmap, alpha_svd=1.0):
             except Exception:
                 pass
             try:
-                types_list.append(
-                    TritonTrue4BitLinear
-                )  
+                types_list.append(TritonTrue4BitLinear)
             except Exception:
                 pass
             valid_types = tuple(types_list) if types_list else (nn.Module,)
@@ -603,103 +606,6 @@ def patch_svd_correction_wrappers(model, shared, bmap, alpha_svd=1.0):
         f"SVD Correction Patching Summary: {patched_count} patched, {skipped_count} skipped"
     )
     return model
-
-
-
-
-
-
-
-def _safe_join(texts, max_chars=None, sep="\n\n"):
-    if max_chars is None:
-        return sep.join(texts)
-    out, total = [], 0
-    for t in texts:
-        if total >= max_chars:
-            break
-        take = t[: max(0, max_chars - total)]
-        out.append(take)
-        total += len(take)
-    return sep.join(out)
-
-
-def load_eval_corpus(
-    dataset_key: str,
-    split: Optional[str] = None,
-    max_docs: Optional[int] = None,
-    max_chars: Optional[int] = None,
-    hf_name: Optional[str] = None,
-    hf_config: Optional[str] = None,
-    text_field: Optional[str] = None,
-):
-    if dataset_key == "wikitext2":
-        ds = load_dataset("wikitext", "wikitext-2-raw-v1", split=split or "test")
-        texts = ds["text"]
-        if max_docs is not None:
-            texts = texts[:max_docs]
-        return _safe_join(texts, max_chars=max_chars)
-
-    elif dataset_key == "ptb":
-        
-        ds = load_dataset("ptb_text_only", split=split or "test")
-        cand_fields = [c for c in ds.column_names if ds[c].dtype == "string"]
-        field = text_field or (
-            "sentence"
-            if "sentence" in ds.column_names
-            else (
-                "text"
-                if "text" in ds.column_names
-                else (cand_fields[0] if cand_fields else ds.column_names[0])
-            )
-        )
-        texts = ds[field]
-        if max_docs is not None:
-            texts = texts[:max_docs]
-        return _safe_join(texts, max_chars=max_chars)
-
-    elif dataset_key == "c4":
-        
-        sp = split or "validation"
-        ds = load_dataset("c4", "en", split=sp, streaming=True)  
-        texts, n = [], 0
-        for ex in ds:
-            t = ex.get("text") or ex.get("content") or ""
-            if t:
-                texts.append(t)
-                n += 1
-                if max_docs is not None and n >= max_docs:
-                    break
-        return _safe_join(texts, max_chars=max_chars)
-
-    elif dataset_key == "hf":
-        if hf_name is None:
-            raise ValueError(
-                "To use --eval_dataset hf, --eval_hf_name is required."
-            )
-        ds = load_dataset(hf_name, hf_config, split=split or "test")
-        
-        if text_field is None:
-            str_fields = []
-            try:
-                for k in ds.column_names:
-                    try:
-                        if ds[k].dtype == "string":
-                            str_fields.append(k)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            if not str_fields:
-                text_field = ds.column_names[0]
-            else:
-                text_field = "text" if "text" in str_fields else str_fields[0]
-        texts = ds[text_field]
-        if max_docs is not None:
-            texts = texts[:max_docs]
-        return _safe_join(texts, max_chars=max_chars)
-
-    else:
-        raise ValueError(f"Unknown eval dataset key: {dataset_key}")
 
 
 @torch.no_grad()
@@ -798,51 +704,161 @@ def measure_generation_metrics(
     }
 
 
+class LMHarnessModelWrapper:
+    def __init__(self, model, device):
+        self.model = model
+        self._device = torch.device(device)
+
+    @property
+    def device(self):
+        return self._device
+
+    def __getattr__(self, name):
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        return getattr(self.model, name)
+
+    def __call__(self, *args, **kwargs):
+        return self.model(*args, **kwargs)
+
+    def forward(self, *args, **kwargs):
+        return self.model.forward(*args, **kwargs)
+
+
+def _resolve_model_device(model, fallback_device):
+    if hasattr(model, "hf_device_map") and model.hf_device_map:
+        first = next(iter(model.hf_device_map.values()))
+        if isinstance(first, str):
+            return torch.device(first)
+        if isinstance(first, torch.device):
+            return first
+    try:
+        param = next(model.parameters())
+        return param.device
+    except StopIteration:
+        pass
+    return torch.device(fallback_device)
+
+
+def _make_harness_table(results):
+    if not LM_HARNESS_AVAILABLE or not results or "results" not in results:
+        return "No harness results"
+    lines = ["| Task | Metric | Value |", "|------|--------|-------|"]
+    for task, metrics in results["results"].items():
+        for metric, value in metrics.items():
+            if isinstance(value, (int, float)):
+                lines.append(f"| {task} | {metric} | {value:.4f} |")
+            else:
+                lines.append(f"| {task} | {metric} | {value} |")
+    return "\n".join(lines)
+
+
+def _sanitize_for_json(obj):
+    if isinstance(obj, dict):
+        return {str(k): _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(v) for v in obj]
+    if isinstance(obj, set):
+        return [_sanitize_for_json(v) for v in sorted(obj, key=str)]
+    if isinstance(obj, torch.Tensor):
+        if obj.numel() == 1:
+            return obj.item()
+        return obj.detach().cpu().tolist()
+    if isinstance(obj, torch.dtype):
+        return str(obj)
+    if isinstance(obj, torch.device):
+        return str(obj)
+    if _HAS_NUMPY:
+        if isinstance(obj, _np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, _np.generic):
+            return obj.item()
+        if isinstance(obj, _np.dtype):
+            return str(obj)
+    if isinstance(obj, (int, float, str, bool)) or obj is None:
+        return obj
+    return str(obj)
+
+
 @torch.no_grad()
-def evaluate(
+def run_lm_harness(
     model,
     tokenizer,
+    tasks,
+    batch_size,
+    num_fewshot,
+    limit,
     device,
-    model_name,
-    dataset_key="wikitext2",
-    split=None,
-    max_docs=64,
-    max_chars=None,
-    seq_len=2048,
-    hf_name=None,
-    hf_config=None,
-    text_field=None,
 ):
-    print(f"\n--- Evaluating {model_name} ---")
-    model.eval()
+    if not LM_HARNESS_AVAILABLE:
+        print("⚠️ lm-eval-harness not installed. Skipping")
+        return {}
 
-    
-    text = load_eval_corpus(
-        dataset_key=dataset_key,
-        split=split,
-        max_docs=max_docs,
-        max_chars=max_chars,
-        hf_name=hf_name,
-        hf_config=hf_config,
-        text_field=text_field,
+    model.eval()
+    clear_group_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    run_device = _resolve_model_device(model, device)
+    wrapper = model if hasattr(model, "device") else LMHarnessModelWrapper(model, run_device)
+
+    hf_model = HFLM(
+        pretrained=wrapper,
+        tokenizer=tokenizer,
+        device=str(run_device),
+        batch_size=batch_size or 1,
+        max_length=2048,
+        add_bos_token=False,
     )
 
-    
+    try:
+        return evaluator.simple_evaluate(
+            model=hf_model,
+            tasks=tasks,
+            num_fewshot=num_fewshot,
+            batch_size=batch_size or 1,
+            limit=limit,
+        )
+    except torch.cuda.OutOfMemoryError:
+        print("💥 CUDA OOM -> retrying with batch_size=1, max_length=1024")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        hf_model = HFLM(
+            pretrained=wrapper,
+            tokenizer=tokenizer,
+            device=str(run_device),
+            batch_size=1,
+            max_length=1024,
+            add_bos_token=False,
+        )
+        try:
+            return evaluator.simple_evaluate(
+                model=hf_model,
+                tasks=tasks,
+                num_fewshot=num_fewshot,
+                batch_size=1,
+                limit=min(100, limit) if isinstance(limit, int) else limit,
+            )
+        except Exception as exc:
+            print(f"❌ Harness retry failed: {exc}")
+            return {}
+
+
+@torch.no_grad()
+def evaluate(model, tokenizer, device, model_name):
+    print(f"\n--- Evaluating {model_name} ---")
+    model.eval()
+    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+    text = "\n\n".join(ds["text"])
     enc = tokenizer(text, return_tensors="pt")
     input_ids = enc.input_ids
-    seq_len_total = input_ids.size(1)
-
-    
+    seq_len = input_ids.size(1)
     total_loss, total_tokens = 0.0, 0
     start_time = time.time()
-    step = seq_len  
-
-    pbar = tqdm(range(0, seq_len_total, step), desc=f"PPL for {model_name}")
-    loss_fct = nn.CrossEntropyLoss()
-
+    pbar = tqdm(range(0, seq_len, 2048), desc=f"PPL for {model_name}")
     for i in pbar:
         clear_group_cache()
-        begin_loc, end_loc = i, min(i + seq_len, seq_len_total)
+        begin_loc, end_loc = i, min(i + 2048, seq_len)
         if end_loc - begin_loc <= 1:
             continue
         input_batch = input_ids[:, begin_loc:end_loc].to(device)
@@ -851,6 +867,7 @@ def evaluate(
         logits = outputs.logits
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
+        loss_fct = nn.CrossEntropyLoss()
         loss = loss_fct(
             shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
         )
@@ -858,9 +875,9 @@ def evaluate(
         total_loss += loss.item() * num_tokens
         total_tokens += num_tokens
         pbar.set_description(f"PPL for {model_name} (Loss: {loss.item():.4f})")
-
+    end_time = time.time()
     ppl = math.exp(total_loss / total_tokens)
-    elapsed_time = time.time() - start_time
+    elapsed_time = end_time - start_time
     print(f"✅ Result for {model_name}: PPL = {ppl:.4f}, Time = {elapsed_time:.2f}s")
     return ppl, elapsed_time
 
@@ -889,10 +906,7 @@ def main():
         help="Required for some model families",
     )
     p.add_argument(
-        "--group_size",
-        type=int,
-        default=128,
-        help="Group size for Triton/CUDA quantization",
+        "--group_size", type=int, default=128, help="Group size for Triton quantization"
     )
     p.add_argument(
         "--skip_gen",
@@ -963,64 +977,60 @@ def main():
         action="store_true",
         help="Skip Wq-only baseline evaluation and print only GlowQ (SVD) results",
     )
-
-    
     p.add_argument(
-        "--eval_dataset",
-        choices=["wikitext2", "c4", "ptb", "hf"],
-        default="wikitext2",
-        help="Evaluation dataset: wikitext2 (default), c4, ptb, or an arbitrary HF dataset (hf)",
-    )
-    p.add_argument(
-        "--eval_split", default=None, help="Evaluation split (default: dataset-specific recommended split)"
-    )
-    p.add_argument(
-        "--eval_max_docs",
-        type=int,
-        default=None,
-        help="Maximum number of documents (default: None, use full split like eval_fp16_ppl.py)",
-    )
-    p.add_argument(
-        "--eval_max_chars",
-        type=int,
-        default=None,
-        help="Character limit (when documents are too long)",
-    )
-    p.add_argument("--eval_seq_len", type=int, default=2048, help="PPL window size (tokens)")
-    p.add_argument(
-        "--use_fast_tokenizer",
+        "--enable_harness",
         action="store_true",
-        help="Use fast tokenizer (default False to match eval_fp16_ppl.py)",
+        help="Run lm-eval-harness (zero-shot) for downstream benchmarks",
     )
     p.add_argument(
-        "--eval_hf_name", default=None, help="HF dataset name when --eval_dataset=hf"
+        "--harness_tasks",
+        type=str,
+        default="arc_easy,piqa,boolq",
+        help="Comma-separated lm-eval-harness task list",
     )
-    p.add_argument("--eval_hf_config", default=None, help="HF config name (if needed)")
     p.add_argument(
-        "--eval_text_field",
+        "--harness_batch_size",
+        type=int,
+        default=1,
+        help="Batch size for lm-eval-harness",
+    )
+    p.add_argument(
+        "--harness_num_fewshot",
+        type=int,
+        default=0,
+        help="Number of few-shot examples (0 keeps zero-shot)",
+    )
+    p.add_argument(
+        "--harness_limit",
+        type=int,
         default=None,
-        help="Text column name (fallback if auto-detection fails)",
+        help="Limit examples per task when running harness",
     )
+    p.add_argument(
+        "--save_harness_results",
+        type=str,
+        default=None,
+        help="Optional path to dump harness JSON results",
+    )
+    p.add_argument(
+        "--clear_cache_before_harness",
+        action="store_true",
+        default=True,
+        help="Clear CUDA/cache state before lm-eval-harness",
+    )
+
     args = p.parse_args()
     device = torch.device(args.device)
-
-    
     tokenizer = AutoTokenizer.from_pretrained(
-        args.model_name,
-        use_fast=args.use_fast_tokenizer,
-        trust_remote_code=args.trust_remote_code,
+        args.model_name, use_fast=True, trust_remote_code=args.trust_remote_code
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-
-    
     default_prompts = [
         "Hello, my name is",
         "The quick brown fox",
         "In a shocking finding, scientists discovered that",
     ]
-
-    
     print(f"📥 Loading original FP16 model: {args.model_name}")
     model_fp16 = AutoModelForCausalLM.from_pretrained(
         args.model_name,
@@ -1028,18 +1038,11 @@ def main():
         device_map="cpu",
         trust_remote_code=args.trust_remote_code,
     )
-
     print(f"📥 Loading original weights from: {args.original_weights_path}")
-    try:
-        original_weights = torch.load(
-            args.original_weights_path, map_location="cpu", weights_only=True
-        )
-    except TypeError:
-        
-        original_weights = torch.load(args.original_weights_path, map_location="cpu")
+    original_weights = torch.load(
+        args.original_weights_path, map_location="cpu", weights_only=True
+    )
     model_fp16.load_state_dict(original_weights)
-
-    
     if args.use_cuda_w4a16:
         _configure_cuda_w4a16_env(args)
         print("🔄 Converting model to CUDA W4A16...")
@@ -1050,55 +1053,37 @@ def main():
         model = convert_to_cuda_w4a16(model_fp16, group_size=args.group_size).to(device)
         method_label = "CUDA W4A16"
     else:
-        if not HAS_TRITON:
-            print(
-                "[WARN] Triton disabled/unavailable; falling back to FP16 (no quant). Use --use_cuda_w4a16 for CUDA path."
-            )
-            model = model_fp16.to(device)
-            method_label = "FP16"
-        else:
-            print(f"🔄 Converting original {args.model_name} model to Triton 4-bit...")
-            model = convert_to_triton_4bit(model_fp16, group_size=args.group_size).to(
-                device
-            )
-            method_label = "Triton 4-bit"
-
-    
-    if model is not model_fp16:
-        del model_fp16, original_weights
+        print(f"🔄 Converting original {args.model_name} model to Triton 4-bit...")
+        model = convert_to_triton_4bit(model_fp16, group_size=args.group_size).to(
+            device
+        )
+        method_label = "Triton 4-bit"
+    del model_fp16, original_weights
     gc.collect()
-    if torch.cuda.is_available():
-        _safe_cuda_empty_cache("step3 main teardown")
+    torch.cuda.empty_cache()
 
-    
     print(
         f"🧩 Loading correction artifacts and patching wrappers for {args.model_name}..."
     )
-    shared = torch.load(args.shared_path, map_location=device)
+    shared = torch.load(args.shared_path, map_location=device, weights_only=True)
     with open(args.bmap_path, "r") as f:
         bmap = json.load(f)
     model = patch_svd_correction_wrappers(model, shared, bmap, alpha_svd=1.0)
-
     results = {}
+
+    def set_svd_alpha(value: float):
+        for module in model.modules():
+            if isinstance(module, AddSVDCorrection):
+                module.alpha_svd = value
 
     if not args.skip_baseline_eval:
         print("\n=== BASELINE EVALUATION (NO SVD CORRECTION) ===")
-        for module in model.modules():
-            if isinstance(module, AddSVDCorrection):
-                module.alpha_svd = 0.0
+        set_svd_alpha(0.0)
         ppl_base, time_base = evaluate(
             model,
             tokenizer,
             device,
             f"{method_label} Original Weights ONLY ({args.model_name})",
-            dataset_key=args.eval_dataset,
-            split=args.eval_split,
-            max_docs=args.eval_max_docs,
-            max_chars=args.eval_max_chars,
-            seq_len=args.eval_seq_len,
-            hf_name=args.eval_hf_name,
-            hf_config=args.eval_hf_config,
-            text_field=args.eval_text_field,
         )
         gen_metrics_base = None
         if not args.skip_gen:
@@ -1133,22 +1118,12 @@ def main():
 
     
     print("\n=== SVD CORRECTION EVALUATION (ALPHA=1.0) ===")
-    for module in model.modules():
-        if isinstance(module, AddSVDCorrection):
-            module.alpha_svd = 1.0
-    ppl_svd, time_svd = evaluate(
+    set_svd_alpha(1.0)
+    ppl, time_val = evaluate(
         model,
         tokenizer,
         device,
         f"{method_label} Original Weights + SVD Correction (SVD α=1.0, {args.model_name})",
-        dataset_key=args.eval_dataset,
-        split=args.eval_split,
-        max_docs=args.eval_max_docs,
-        max_chars=args.eval_max_chars,
-        seq_len=args.eval_seq_len,
-        hf_name=args.eval_hf_name,
-        hf_config=args.eval_hf_config,
-        text_field=args.eval_text_field,
     )
     gen_metrics_svd = None
     if not args.skip_gen:
@@ -1174,40 +1149,98 @@ def main():
             print(f"Generation measurement failed for SVD: {e}")
             gen_metrics_svd = None
     results["svd"] = {
-        "ppl": ppl_svd,
-        "time": time_svd,
+        "ppl": ppl,
+        "time": time_val,
         "generation_metrics": gen_metrics_svd,
     }
 
-    
-    print(f"\n{'='*15} FINAL SUMMARY ({args.model_name} + SVD Correction) {'='*15}")
-    print(f"Model: {args.model_name}")
-    print(
-        f"Eval: dataset={args.eval_dataset}, split={args.eval_split or '(default)'}; max_docs={args.eval_max_docs}; seq_len={args.eval_seq_len}"
-    )
-    print("-" * 100)
-    print(
-        f"{'Method':<50} | {'Perplexity':<10} | {'Time (s)':<8} | {'TTFB(ms)':<10} | {'tok/s':<10}"
-    )
-    print("-" * 100)
+    if args.enable_harness:
+        tasks = [t.strip() for t in args.harness_tasks.split(",") if t.strip()]
+        if not tasks:
+            tasks = ["arc_easy", "piqa", "boolq"]
+        print("\n🎯 Starting LM Harness evaluation (zero-shot)...")
 
-    if "baseline" in results:
-        base = results["baseline"]
-        base_gen = base.get("generation_metrics") or {}
-        base_ttfb = f"{base_gen.get('ttfb_ms_median', 0):.1f}" if base_gen else "-"
-        base_tokps = f"{base_gen.get('tok_s_median', 0):.2f}" if base_gen else "-"
-        print(
-            f"{(method_label + ' (Baseline)'):<50} | {base['ppl']:<10.4f} | {base['time']:<8.2f} | {base_ttfb:<10} | {base_tokps:<10}"
+        def maybe_clear_cache():
+            if args.clear_cache_before_harness and torch.cuda.is_available():
+                print("🧹 Clearing CUDA cache...")
+                torch.cuda.empty_cache()
+
+        def print_harness_summary(label, data):
+            print(f"\n[{label}] Harness results")
+            if not data or "results" not in data:
+                print("   (No results)")
+                return
+            print(_make_harness_table(data))
+            acc_values = []
+            for task_name, metrics in data["results"].items():
+                for key in ("acc,none", "acc", "accuracy", "acc_norm,none", "acc_norm"):
+                    if key in metrics:
+                        val = metrics[key]
+                        acc_values.append(val)
+                        print(f"   {task_name}: {val:.4f}")
+                        break
+            if acc_values:
+                print(f"   Avg accuracy: {sum(acc_values) / len(acc_values):.4f}")
+
+        harness_payload = {}
+
+        if not args.skip_baseline_eval:
+            maybe_clear_cache()
+            set_svd_alpha(0.0)
+            baseline_harness = run_lm_harness(
+                model=model,
+                tokenizer=tokenizer,
+                tasks=tasks,
+                batch_size=args.harness_batch_size,
+                num_fewshot=args.harness_num_fewshot,
+                limit=args.harness_limit,
+                device=args.device,
+            )
+            results["baseline"]["harness"] = baseline_harness
+            harness_payload["baseline"] = baseline_harness
+            print_harness_summary("Baseline (α=0.0)", baseline_harness)
+
+        maybe_clear_cache()
+        set_svd_alpha(1.0)
+        harness_svd = run_lm_harness(
+            model=model,
+            tokenizer=tokenizer,
+            tasks=tasks,
+            batch_size=args.harness_batch_size,
+            num_fewshot=args.harness_num_fewshot,
+            limit=args.harness_limit,
+            device=args.device,
         )
+        results["svd"]["harness"] = harness_svd
+        harness_payload["svd"] = harness_svd
+        print_harness_summary("SVD (α=1.0)", harness_svd)
 
-    svd = results["svd"]
-    svd_gen = svd.get("generation_metrics") or {}
-    svd_ttfb = f"{svd_gen.get('ttfb_ms_median', 0):.1f}" if svd_gen else "-"
-    svd_tokps = f"{svd_gen.get('tok_s_median', 0):.2f}" if svd_gen else "-"
-    print(
-        f"{(method_label + ' + SVD Correction (α=1.0)'):<50} | {svd['ppl']:<10.4f} | {svd['time']:<8.2f} | {svd_ttfb:<10} | {svd_tokps:<10}"
-    )
-    print("=" * 100)
+        if args.save_harness_results:
+            try:
+                with open(args.save_harness_results, "w") as f:
+                    json.dump(_sanitize_for_json(harness_payload), f, indent=2)
+                print(f"📄 Saved Harness results: {args.save_harness_results}")
+            except Exception as exc:
+                print(f"⚠️ Failed to save Harness results: {exc}")
+
+        set_svd_alpha(1.0)
+
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
 
 
 if __name__ == "__main__":

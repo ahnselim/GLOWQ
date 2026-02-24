@@ -12,7 +12,7 @@ import json
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from step3_eval_integrated import (
+from step3_evaluate import (
     AddSVDCorrection,
     apply_activation_fake_quant,
     apply_quantized_weights,

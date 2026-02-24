@@ -1,6 +1,6 @@
 """
-w_type/step3_eval_integrated.py
-Provides the integrated evaluation pipeline for weight-type quantized models with Shared-B SVD correction.
+w4ax/step3_evaluate.py
+Provides the integrated W4Ax evaluation pipeline with activation fake quantization and Shared-B SVD patching.
 output :
 (no output files)
 `-- stdout/stderr metrics and logs only

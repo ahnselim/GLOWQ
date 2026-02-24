@@ -151,7 +151,7 @@ Both scripts take one argument `CONFIG` (a TOML file path or a file name under `
 
 - Step1: quantization error extraction
 - Step2: randomized GSVD / shared low-rank artifact generation
-- Step3: evaluation (`step3_decode_cache_nodict_eval.py` or `step3_decode_cache_lm.py`)
+- Step3: evaluation (`step3_eval_dataset.py` or `step3_lm_eval.py`)
 
 Run with:
 
@@ -237,7 +237,7 @@ Useful aliases are also accepted (for example: `norm`, `normalized`, `fro`, `cos
 
 ### LM Harness Mode
 
-If `lm_harness = true` in config, `run_glowq.py` step3 uses `src/step3_decode_cache_lm.py`, which requires `lm-eval`.
+If `lm_harness = true` in config, `run_glowq.py` step3 uses `src/step3_lm_eval.py`, which requires `lm-eval`.
 
 ## Output Structure
 
@@ -259,7 +259,7 @@ step2/
   low_rank_shared.pt
   b_ref_map.json
 logs/
-  step2_randomized_gsvd_integrated.log
+  step2_rsvd.log
 ```
 
 ### GlowQ-S Pipeline (`run_glowq_s.py`)

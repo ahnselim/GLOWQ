@@ -1,6 +1,6 @@
 """
-w4ax/step3_eval_integrated.py
-Provides the integrated W4Ax evaluation pipeline with activation fake quantization and Shared-B SVD patching.
+moe_ffn/step3_evaluate.py
+Evaluates MoE fake-quant models with Shared-B SVD correction and activation quantization in an integrated pipeline.
 output :
 (no output files)
 `-- stdout/stderr metrics and logs only
@@ -162,25 +162,19 @@ class AddSVDCorrection(nn.Module):
 
 
             if z.shape != svd_raw.shape:
-
                 if len(z.shape) == len(svd_raw.shape):
-
                     if z.shape[:-1] == svd_raw.shape[:-1]:
                         min_last_dim = min(z.shape[-1], svd_raw.shape[-1])
                         svd_raw = svd_raw[..., :min_last_dim]
                         if z.shape[-1] > min_last_dim:
-
                             pad_size = z.shape[-1] - min_last_dim
                             svd_raw = F.pad(svd_raw, (0, pad_size))
                     else:
-
                         if svd_raw.numel() == z.numel():
                             svd_raw = svd_raw.reshape(z.shape)
                         else:
-
                             return z
                 else:
-
                     if svd_raw.numel() == z.numel():
                         svd_raw = svd_raw.reshape(z.shape)
                     else:
@@ -188,11 +182,9 @@ class AddSVDCorrection(nn.Module):
 
             return z.add_(svd_raw, alpha=self.alpha_svd)
 
-        except RuntimeError as e:
-
+        except RuntimeError:
             return z
-        except Exception as e:
-
+        except Exception:
             return z
 
 
@@ -274,7 +266,9 @@ def measure_generation_metrics(
                         "attention_mask" in inputs
                         and inputs["attention_mask"].dim() == 1
                     ):
-                        inputs["attention_mask"] = inputs["attention_mask"].unsqueeze(0)
+                        inputs["attention_mask"] = inputs[
+                            "attention_mask"
+                        ].unsqueeze(0)
                     _cuda_sync(device)
                     t0 = perf_counter()
                     model.generate(**inputs, max_new_tokens=1, **gen_kwargs)
@@ -291,7 +285,6 @@ def measure_generation_metrics(
                         _get_sequences_from_generate(outN).shape[1]
                         - inputs["input_ids"].shape[1]
                     )
-
                     tokps = (gen_tokens / t_total) if t_total > 0 else 0.0
                     tokps_list.append(tokps)
                     total_times.append(t_total)
@@ -299,7 +292,6 @@ def measure_generation_metrics(
                 except Exception as e:
                     print(f"Warning: Generation measurement failed for prompt '{prompt[:30]}...': {e}")
                     continue
-
 
     return {
         "ttfb_ms_mean": mean(ttfb_list_ms) if ttfb_list_ms else 0,
@@ -359,7 +351,6 @@ def fake_quantize_activation(
     zeros = torch.round(-min_vals / scales).clamp(0, qmax)
     quant = torch.round(grouped / scales + zeros).clamp(0, qmax)
     dequant = (quant - zeros) * scales
-
 
     tiny_mask = (ranges < 1e-8).expand_as(grouped)
     if tiny_mask.any():
@@ -443,7 +434,6 @@ def apply_activation_fake_quant(
         if current is None:
             continue
         if isinstance(current, ActivationFakeQuantWrapper):
-
             current.act_bits = act_bits
             current.group_size = group_size
             continue
@@ -564,7 +554,7 @@ def safe_percentage_change(new_val, old_val):
 
 def main():
     p = argparse.ArgumentParser(
-        description="Evaluate Triton Asymmetric model with Shared-B optimization for {model}."
+        description="Evaluate FakeQuant model with Shared-B optimization (FP16 + W4A? + SVD)."
     )
     p.add_argument("--model_name", required=True)
     p.add_argument("--shared_path", required=True)
@@ -572,12 +562,12 @@ def main():
     p.add_argument(
         "--original_weights_path",
         required=True,
-        help="Path to original weights (from step1)",
+        help="Path to original weights (from step1, FP16 state_dict).",
     )
     p.add_argument(
         "--quantized_weights_path",
         required=True,
-        help="Path to fake-quant (dequantized) weights saved in step1",
+        help="Path to fake-quant (dequantized) weights saved in step1 (subset dict).",
     )
     p.add_argument("--device", default="cuda:0")
     p.add_argument(
@@ -623,6 +613,7 @@ def main():
 
     args = p.parse_args()
     device = torch.device(args.device)
+
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name, use_fast=True, trust_remote_code=args.trust_remote_code
     )
@@ -633,8 +624,10 @@ def main():
         "The quick brown fox",
         "In a shocking finding, scientists discovered that",
     ]
-    print(f"📥 Loading original FP16 model for baseline comparison: {args.model_name}")
-    model_fp16 = AutoModelForCausalLM.from_pretrained(
+
+
+    print(f"📥 Loading FP16 model for baseline comparison: {args.model_name}")
+    model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         torch_dtype=torch.float16,
         device_map="cpu",
@@ -644,26 +637,66 @@ def main():
     original_weights = torch.load(
         args.original_weights_path, map_location="cpu", weights_only=True
     )
-    model_fp16.load_state_dict(original_weights)
+    model.load_state_dict(original_weights)
     del original_weights
+    gc.collect()
+    torch.cuda.empty_cache()
 
-    print(f"📦 Loading fake-quant weights from: {args.quantized_weights_path}")
+    model = model.to(device)
+
+    results = {}
+
+    print("\n=== FP16 BASELINE EVALUATION (ORIGINAL MODEL) ===")
+    ppl_fp16, time_fp16 = evaluate(
+        model, tokenizer, device, f"FP16 (Original, {args.model_name})"
+    )
+    gen_metrics_fp16 = None
+    if not args.skip_gen:
+        print("Measuring generation metrics for FP16 baseline...")
+        try:
+            gen_metrics_fp16 = measure_generation_metrics(
+                model,
+                tokenizer,
+                device,
+                prompts=default_prompts,
+                max_new_tokens=args.gen_max_new_tokens,
+                do_sample=args.gen_do_sample,
+                num_beams=args.gen_num_beams,
+                temperature=args.gen_temperature,
+                top_p=args.gen_top_p,
+                repeats=args.gen_repeats,
+            )
+            print(
+                f"   • FP16 TTFB: {gen_metrics_fp16['ttfb_ms_median']:.1f}ms (median)"
+            )
+            print(
+                f"   • FP16 Throughput: {gen_metrics_fp16['tok_s_median']:.2f} tok/s (median)"
+            )
+        except Exception as e:
+            print(f"Generation measurement failed for FP16 baseline: {e}")
+            gen_metrics_fp16 = None
+
+    results["fp16"] = {
+        "ppl": ppl_fp16,
+        "time": time_fp16,
+        "generation_metrics": gen_metrics_fp16,
+    }
+
+
+    method_label = "Fake-Quant W4A? GEMM"
+
+    print(f"\n📦 Loading fake-quant weights from: {args.quantized_weights_path}")
     fake_quant_weights = torch.load(
         args.quantized_weights_path, map_location="cpu", weights_only=True
     )
-    apply_quantized_weights(model_fp16, fake_quant_weights)
+    apply_quantized_weights(model, fake_quant_weights)
     del fake_quant_weights
-
-    model = model_fp16.to(device)
-    method_label = "Fake-Quant W4A8 GEMM"
-    del model_fp16
     gc.collect()
     torch.cuda.empty_cache()
 
     print(
         f"🧩 Loading correction artifacts and patching wrappers for {args.model_name} ..."
     )
-
     shared = torch.load(args.shared_path, map_location=device, weights_only=True)
     with open(args.bmap_path, "r") as f:
         bmap = json.load(f)
@@ -678,10 +711,7 @@ def main():
     model = patch_svd_correction_wrappers(model, shared, bmap, alpha_svd=1.0)
 
 
-    results = {}
-
-
-    print("\n=== BASELINE EVALUATION (NO SVD CORRECTION) ===")
+    print("\n=== BASELINE EVALUATION (FAKE-QUANT, NO SVD) ===")
     for module in model.modules():
         if isinstance(module, AddSVDCorrection):
             module.alpha_svd = 0.0
@@ -690,7 +720,7 @@ def main():
     )
     gen_metrics_base = None
     if not args.skip_gen:
-        print(f"Measuring generation metrics for baseline...")
+        print(f"Measuring generation metrics for fake-quant baseline...")
         try:
             gen_metrics_base = measure_generation_metrics(
                 model,
@@ -711,7 +741,7 @@ def main():
                 f"   • Baseline Throughput: {gen_metrics_base['tok_s_median']:.2f} tok/s (median)"
             )
         except Exception as e:
-            print(f"Generation measurement failed for baseline: {e}")
+            print(f"Generation measurement failed for fake-quant baseline: {e}")
             gen_metrics_base = None
     results["baseline"] = {
         "ppl": ppl_base,
@@ -724,7 +754,7 @@ def main():
     for module in model.modules():
         if isinstance(module, AddSVDCorrection):
             module.alpha_svd = 1.0
-    ppl, time_val = evaluate(
+    ppl_svd, time_svd = evaluate(
         model,
         tokenizer,
         device,
@@ -754,18 +784,15 @@ def main():
             print(f"Generation measurement failed for SVD: {e}")
             gen_metrics_svd = None
     results["svd"] = {
-        "ppl": ppl,
-        "time": time_val,
+        "ppl": ppl_svd,
+        "time": time_svd,
         "generation_metrics": gen_metrics_svd,
     }
 
 
     if not args.skip_gen and gen_metrics_svd:
         print("\n=== A@B@X vs OPTIMIZED CACHING COMPARISON ===")
-
-
         print("🔍 Measuring A@B@X (No Caching) performance...")
-
 
         original_is_group = {}
         for weight_name, bkey in bmap.items():
@@ -776,7 +803,7 @@ def main():
                 if isinstance(wrapper, AddSVDCorrection):
                     original_is_group[module_name] = wrapper.is_group
                     wrapper.is_group = False
-            except:
+            except Exception:
                 continue
 
         clear_group_cache()
@@ -796,15 +823,13 @@ def main():
             )
 
             results["no_cache_abx"] = {
-                "ppl": ppl,
-                "time": time_val,
+                "ppl": ppl_svd,
+                "time": time_svd,
                 "generation_metrics": gen_metrics_no_cache,
             }
-
         except Exception as e:
             print(f"A@B@X measurement failed: {e}")
             results["no_cache_abx"] = None
-
 
         for module_name, was_group in original_is_group.items():
             try:
@@ -812,19 +837,30 @@ def main():
                 wrapper = getattr(parent, attr_name)
                 if isinstance(wrapper, AddSVDCorrection):
                     wrapper.is_group = was_group
-            except:
+            except Exception:
                 continue
 
 
     print(
-        f"\n{'='*15} FINAL SUMMARY ({args.model_name} + Fake-Quant W4A8 + Shared-B) {'='*15}"
+        f"\n{'='*15} FINAL SUMMARY ({args.model_name} + Fake-Quant + Shared-B) {'='*15}"
     )
-    print(f"Model: {args.model_name} (Fake-Quant W4A8 GEMM, )")
+    print(f"Model: {args.model_name} (FP16 vs Fake-Quant vs Fake-Quant+SVD, )")
     print("-" * 120)
     print(
         f"{'Method':<50} | {'Perplexity':<10} | {'Time (s)':<8} | {'TTFB(ms)':<10} | {'tok/s':<10}"
     )
     print("-" * 120)
+
+
+    fp16_data = results["fp16"]
+    fp16_gen = fp16_data.get("generation_metrics")
+    ttfb_fp16_str = f"{fp16_gen['ttfb_ms_median']:.1f}" if fp16_gen else "-"
+    tok_s_fp16_str = f"{fp16_gen['tok_s_median']:.2f}" if fp16_gen else "-"
+    print(
+        f"{'FP16 (original)':<50} | {fp16_data['ppl']:<10.4f} | {fp16_data['time']:<8.2f} | {ttfb_fp16_str:<10} | {tok_s_fp16_str:<10}"
+    )
+
+
     base_data = results["baseline"]
     base_gen = base_data.get("generation_metrics")
     ttfb_base_str = f"{base_gen['ttfb_ms_median']:.1f}" if base_gen else "-"
@@ -832,6 +868,8 @@ def main():
     print(
         f"{method_label + ' Baseline (no SVD)':<50} | {base_data['ppl']:<10.4f} | {base_data['time']:<8.2f} | {ttfb_base_str:<10} | {tok_s_base_str:<10}"
     )
+
+
     svd_data = results["svd"]
     svd_gen = svd_data.get("generation_metrics")
     ttfb_svd_str = f"{svd_gen['ttfb_ms_median']:.1f}" if svd_gen else "-"
@@ -848,10 +886,8 @@ def main():
             ttfb_abx_str = f"{abx_gen['ttfb_ms_median']:.1f}"
             tok_s_abx_str = f"{abx_gen['tok_s_median']:.2f}"
 
-
             ttfb_vs_abx = safe_percentage_change(svd_gen['ttfb_ms_median'], abx_gen['ttfb_ms_median'])
             throughput_vs_abx = safe_percentage_change(svd_gen['tok_s_median'], abx_gen['tok_s_median'])
-
 
             if abs(ttfb_vs_abx) == float('inf'):
                 ttfb_vs_abx_str = "N/A"
@@ -865,11 +901,12 @@ def main():
 
             improvement_vs_abx = f"vs A@B@X: TTFB {ttfb_vs_abx_str}, Tput {throughput_vs_abx_str}"
 
-            print(f"{'A@B@X (No Cache)':<50} | {abx_data['ppl']:<10.4f} | {abx_data['time']:<8.2f} | {ttfb_abx_str:<10} | {tok_s_abx_str:<10}")
+            print(
+                f"{'A@B@X (No Cache)':<50} | {abx_data['ppl']:<10.4f} | {abx_data['time']:<8.2f} | {ttfb_abx_str:<10} | {tok_s_abx_str:<10}"
+            )
             print("-" * 120)
         else:
             print(f"{'A@B@X (No Cache)':<50} | {'FAILED':<10} | {'-':<8} | {'-':<10} | {'-':<10}")
-
     print("=" * 120)
 
 

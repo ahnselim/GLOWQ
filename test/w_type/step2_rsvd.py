@@ -1,5 +1,5 @@
 """
-w_type/step2_randomized_gsvd.py
+w_type/step2_rsvd.py
 Runs integrated randomized GSVD with Shared-B grouping and error statistics for weight-type comparisons.
 output :
 <output_path>/

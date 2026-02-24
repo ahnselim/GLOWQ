@@ -1,18 +1,57 @@
-quantize/
-*.pt
-*outputs*
-*output*
-__pycache__
-*.txt
-results/
-cache
-experiments
-*.json
-*.log
-*.ipynb
-output
-teacher*
-*nohup*
-*differences*
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Compiled extensions / native build products
+*.so
+*.pyd
+*.dll
+*.dylib
+*.o
+*.a
+*.obj
+
+# Build / packaging directories
 build/
-pt_files/
+dist/
+pip-wheel-metadata/
+*.egg-info/
+.eggs/
+
+# Virtual environments / local config
+.venv/
+.env
+.envrc
+*.env
+
+# Generated datasets, checkpoints, logs, and caches
+*output*
+*outputs*
+cache/
+hf_cache/
+data/
+downloads/
+logs/
+*.pt
+*.bin
+*.ckpt
+*.safetensors
+*.npz
+*.npy
+*.onnx
+*.tar
+*.tgz
+*.tmp
+*.log
+*.jsonl
+
+# CSV search results (always regenerated)
+*.csv
+
+# Misc
+*.out
+.DS_Store
+Thumbs.db
+*.json
+

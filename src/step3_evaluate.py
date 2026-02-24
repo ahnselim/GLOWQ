@@ -1,12 +1,10 @@
 """
-src/step3_decode_cache_lm.py
-Evaluates dict-free decode-cache SVD correction with PPL/generation metrics and optional lm-eval-harness benchmarks.
+src/step3_evaluate.py
+Evaluates dict-free decode-cache SVD correction with baseline/SVD PPL and generation performance comparisons.
 output :
-(stdout only by default)
-|-- Baseline vs SVD metrics      (PPL, timing, generation metrics)
-`-- LM Harness summaries         (when --enable_harness)
-(optional)
-`-- <save_harness_results>       (.json)
+(stdout only)
+|-- Baseline metrics         (PPL, timing, generation metrics)
+`-- SVD-corrected metrics    (PPL, timing, generation metrics)
 """
 
 import argparse, json, torch, torch.nn as nn, torch.nn.functional as F, math, gc, os, time, re, sys
@@ -17,25 +15,6 @@ from typing import Optional
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
-
-
-
-
-try:
-    from lm_eval import evaluator
-    from lm_eval.models.huggingface import HFLM
-
-    LM_HARNESS_AVAILABLE = True
-except Exception:
-    LM_HARNESS_AVAILABLE = False
-    print("⚠️ lm-eval-harness not available. pip install lm-eval")
-
-try:
-    import numpy as _np
-
-    _HAS_NUMPY = True
-except Exception:
-    _HAS_NUMPY = False
 
 
 
@@ -65,6 +44,7 @@ def _configure_cuda_w4a16_env(args) -> None:
     if not getattr(args, "use_cuda_w4a16", False):
         return
 
+    # Keep old step3 behavior (fp16 activations) while using the new QM-style kernel flow.
     os.environ.setdefault("W4A16_KERNEL_OUT_DTYPE", "fp16")
     os.environ.setdefault("W4A16_GEMM_CUDA", "1")
     os.environ.setdefault("W4A16_DEQUANT_CACHE", "0")
@@ -704,146 +684,6 @@ def measure_generation_metrics(
     }
 
 
-class LMHarnessModelWrapper:
-    def __init__(self, model, device):
-        self.model = model
-        self._device = torch.device(device)
-
-    @property
-    def device(self):
-        return self._device
-
-    def __getattr__(self, name):
-        if name.startswith("__") and name.endswith("__"):
-            raise AttributeError(name)
-        return getattr(self.model, name)
-
-    def __call__(self, *args, **kwargs):
-        return self.model(*args, **kwargs)
-
-    def forward(self, *args, **kwargs):
-        return self.model.forward(*args, **kwargs)
-
-
-def _resolve_model_device(model, fallback_device):
-    if hasattr(model, "hf_device_map") and model.hf_device_map:
-        first = next(iter(model.hf_device_map.values()))
-        if isinstance(first, str):
-            return torch.device(first)
-        if isinstance(first, torch.device):
-            return first
-    try:
-        param = next(model.parameters())
-        return param.device
-    except StopIteration:
-        pass
-    return torch.device(fallback_device)
-
-
-def _make_harness_table(results):
-    if not LM_HARNESS_AVAILABLE or not results or "results" not in results:
-        return "No harness results"
-    lines = ["| Task | Metric | Value |", "|------|--------|-------|"]
-    for task, metrics in results["results"].items():
-        for metric, value in metrics.items():
-            if isinstance(value, (int, float)):
-                lines.append(f"| {task} | {metric} | {value:.4f} |")
-            else:
-                lines.append(f"| {task} | {metric} | {value} |")
-    return "\n".join(lines)
-
-
-def _sanitize_for_json(obj):
-    if isinstance(obj, dict):
-        return {str(k): _sanitize_for_json(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_sanitize_for_json(v) for v in obj]
-    if isinstance(obj, set):
-        return [_sanitize_for_json(v) for v in sorted(obj, key=str)]
-    if isinstance(obj, torch.Tensor):
-        if obj.numel() == 1:
-            return obj.item()
-        return obj.detach().cpu().tolist()
-    if isinstance(obj, torch.dtype):
-        return str(obj)
-    if isinstance(obj, torch.device):
-        return str(obj)
-    if _HAS_NUMPY:
-        if isinstance(obj, _np.ndarray):
-            return obj.tolist()
-        if isinstance(obj, _np.generic):
-            return obj.item()
-        if isinstance(obj, _np.dtype):
-            return str(obj)
-    if isinstance(obj, (int, float, str, bool)) or obj is None:
-        return obj
-    return str(obj)
-
-
-@torch.no_grad()
-def run_lm_harness(
-    model,
-    tokenizer,
-    tasks,
-    batch_size,
-    num_fewshot,
-    limit,
-    device,
-):
-    if not LM_HARNESS_AVAILABLE:
-        print("⚠️ lm-eval-harness not installed. Skipping")
-        return {}
-
-    model.eval()
-    clear_group_cache()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    run_device = _resolve_model_device(model, device)
-    wrapper = model if hasattr(model, "device") else LMHarnessModelWrapper(model, run_device)
-
-    hf_model = HFLM(
-        pretrained=wrapper,
-        tokenizer=tokenizer,
-        device=str(run_device),
-        batch_size=batch_size or 1,
-        max_length=2048,
-        add_bos_token=False,
-    )
-
-    try:
-        return evaluator.simple_evaluate(
-            model=hf_model,
-            tasks=tasks,
-            num_fewshot=num_fewshot,
-            batch_size=batch_size or 1,
-            limit=limit,
-        )
-    except torch.cuda.OutOfMemoryError:
-        print("💥 CUDA OOM -> retrying with batch_size=1, max_length=1024")
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        hf_model = HFLM(
-            pretrained=wrapper,
-            tokenizer=tokenizer,
-            device=str(run_device),
-            batch_size=1,
-            max_length=1024,
-            add_bos_token=False,
-        )
-        try:
-            return evaluator.simple_evaluate(
-                model=hf_model,
-                tasks=tasks,
-                num_fewshot=num_fewshot,
-                batch_size=1,
-                limit=min(100, limit) if isinstance(limit, int) else limit,
-            )
-        except Exception as exc:
-            print(f"❌ Harness retry failed: {exc}")
-            return {}
-
-
 @torch.no_grad()
 def evaluate(model, tokenizer, device, model_name):
     print(f"\n--- Evaluating {model_name} ---")
@@ -973,56 +813,17 @@ def main():
         help="Force W4A16 GEMV path",
     )
     p.add_argument(
-        "--skip_baseline_eval",
+        "--use_fast_tokenizer",
         action="store_true",
-        help="Skip Wq-only baseline evaluation and print only GlowQ (SVD) results",
-    )
-    p.add_argument(
-        "--enable_harness",
-        action="store_true",
-        help="Run lm-eval-harness (zero-shot) for downstream benchmarks",
-    )
-    p.add_argument(
-        "--harness_tasks",
-        type=str,
-        default="arc_easy,piqa,boolq",
-        help="Comma-separated lm-eval-harness task list",
-    )
-    p.add_argument(
-        "--harness_batch_size",
-        type=int,
-        default=1,
-        help="Batch size for lm-eval-harness",
-    )
-    p.add_argument(
-        "--harness_num_fewshot",
-        type=int,
-        default=0,
-        help="Number of few-shot examples (0 keeps zero-shot)",
-    )
-    p.add_argument(
-        "--harness_limit",
-        type=int,
-        default=None,
-        help="Limit examples per task when running harness",
-    )
-    p.add_argument(
-        "--save_harness_results",
-        type=str,
-        default=None,
-        help="Optional path to dump harness JSON results",
-    )
-    p.add_argument(
-        "--clear_cache_before_harness",
-        action="store_true",
-        default=True,
-        help="Clear CUDA/cache state before lm-eval-harness",
+        help="Use fast tokenizer (default False to match eval_fp16_ppl.py)",
     )
 
     args = p.parse_args()
     device = torch.device(args.device)
     tokenizer = AutoTokenizer.from_pretrained(
-        args.model_name, use_fast=True, trust_remote_code=args.trust_remote_code
+        args.model_name,
+        use_fast=args.use_fast_tokenizer,
+        trust_remote_code=args.trust_remote_code,
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -1031,7 +832,7 @@ def main():
         "The quick brown fox",
         "In a shocking finding, scientists discovered that",
     ]
-    print(f"📥 Loading original FP16 model: {args.model_name}")
+    print(f"📥 Loading original FP16 model for baseline comparison: {args.model_name}")
     model_fp16 = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         torch_dtype=torch.float16,
@@ -1071,54 +872,53 @@ def main():
     model = patch_svd_correction_wrappers(model, shared, bmap, alpha_svd=1.0)
     results = {}
 
-    def set_svd_alpha(value: float):
-        for module in model.modules():
-            if isinstance(module, AddSVDCorrection):
-                module.alpha_svd = value
-
-    if not args.skip_baseline_eval:
-        print("\n=== BASELINE EVALUATION (NO SVD CORRECTION) ===")
-        set_svd_alpha(0.0)
-        ppl_base, time_base = evaluate(
-            model,
-            tokenizer,
-            device,
-            f"{method_label} Original Weights ONLY ({args.model_name})",
-        )
-        gen_metrics_base = None
-        if not args.skip_gen:
-            print("Measuring generation metrics for baseline...")
-            try:
-                gen_metrics_base = measure_generation_metrics(
-                    model,
-                    tokenizer,
-                    device,
-                    prompts=default_prompts,
-                    max_new_tokens=args.gen_max_new_tokens,
-                    do_sample=args.gen_do_sample,
-                    num_beams=args.gen_num_beams,
-                    temperature=args.gen_temperature,
-                    top_p=args.gen_top_p,
-                    repeats=args.gen_repeats,
-                )
-                print(
-                    f"   • Baseline TTFB: {gen_metrics_base['ttfb_ms_median']:.1f}ms (median)"
-                )
-                print(
-                    f"   • Baseline Throughput: {gen_metrics_base['tok_s_median']:.2f} tok/s (median)"
-                )
-            except Exception as e:
-                print(f"Generation measurement failed for baseline: {e}")
-                gen_metrics_base = None
-        results["baseline"] = {
-            "ppl": ppl_base,
-            "time": time_base,
-            "generation_metrics": gen_metrics_base,
-        }
+    
+    print("\n=== BASELINE EVALUATION (NO SVD CORRECTION) ===")
+    for module in model.modules():
+        if isinstance(module, AddSVDCorrection):
+            module.alpha_svd = 0.0
+    ppl_base, time_base = evaluate(
+        model,
+        tokenizer,
+        device,
+        f"{method_label} Original Weights ONLY ({args.model_name})",
+    )
+    gen_metrics_base = None
+    if not args.skip_gen:
+        print(f"Measuring generation metrics for baseline...")
+        try:
+            gen_metrics_base = measure_generation_metrics(
+                model,
+                tokenizer,
+                device,
+                prompts=default_prompts,
+                max_new_tokens=args.gen_max_new_tokens,
+                do_sample=args.gen_do_sample,
+                num_beams=args.gen_num_beams,
+                temperature=args.gen_temperature,
+                top_p=args.gen_top_p,
+                repeats=args.gen_repeats,
+            )
+            print(
+                f"   • Baseline TTFB: {gen_metrics_base['ttfb_ms_median']:.1f}ms (median)"
+            )
+            print(
+                f"   • Baseline Throughput: {gen_metrics_base['tok_s_median']:.2f} tok/s (median)"
+            )
+        except Exception as e:
+            print(f"Generation measurement failed for baseline: {e}")
+            gen_metrics_base = None
+    results["baseline"] = {
+        "ppl": ppl_base,
+        "time": time_base,
+        "generation_metrics": gen_metrics_base,
+    }
 
     
     print("\n=== SVD CORRECTION EVALUATION (ALPHA=1.0) ===")
-    set_svd_alpha(1.0)
+    for module in model.modules():
+        if isinstance(module, AddSVDCorrection):
+            module.alpha_svd = 1.0
     ppl, time_val = evaluate(
         model,
         tokenizer,
@@ -1154,93 +954,22 @@ def main():
         "generation_metrics": gen_metrics_svd,
     }
 
-    if args.enable_harness:
-        tasks = [t.strip() for t in args.harness_tasks.split(",") if t.strip()]
-        if not tasks:
-            tasks = ["arc_easy", "piqa", "boolq"]
-        print("\n🎯 Starting LM Harness evaluation (zero-shot)...")
-
-        def maybe_clear_cache():
-            if args.clear_cache_before_harness and torch.cuda.is_available():
-                print("🧹 Clearing CUDA cache...")
-                torch.cuda.empty_cache()
-
-        def print_harness_summary(label, data):
-            print(f"\n[{label}] Harness results")
-            if not data or "results" not in data:
-                print("   (No results)")
-                return
-            print(_make_harness_table(data))
-            acc_values = []
-            for task_name, metrics in data["results"].items():
-                for key in ("acc,none", "acc", "accuracy", "acc_norm,none", "acc_norm"):
-                    if key in metrics:
-                        val = metrics[key]
-                        acc_values.append(val)
-                        print(f"   {task_name}: {val:.4f}")
-                        break
-            if acc_values:
-                print(f"   Avg accuracy: {sum(acc_values) / len(acc_values):.4f}")
-
-        harness_payload = {}
-
-        if not args.skip_baseline_eval:
-            maybe_clear_cache()
-            set_svd_alpha(0.0)
-            baseline_harness = run_lm_harness(
-                model=model,
-                tokenizer=tokenizer,
-                tasks=tasks,
-                batch_size=args.harness_batch_size,
-                num_fewshot=args.harness_num_fewshot,
-                limit=args.harness_limit,
-                device=args.device,
-            )
-            results["baseline"]["harness"] = baseline_harness
-            harness_payload["baseline"] = baseline_harness
-            print_harness_summary("Baseline (α=0.0)", baseline_harness)
-
-        maybe_clear_cache()
-        set_svd_alpha(1.0)
-        harness_svd = run_lm_harness(
-            model=model,
-            tokenizer=tokenizer,
-            tasks=tasks,
-            batch_size=args.harness_batch_size,
-            num_fewshot=args.harness_num_fewshot,
-            limit=args.harness_limit,
-            device=args.device,
-        )
-        results["svd"]["harness"] = harness_svd
-        harness_payload["svd"] = harness_svd
-        print_harness_summary("SVD (α=1.0)", harness_svd)
-
-        if args.save_harness_results:
-            try:
-                with open(args.save_harness_results, "w") as f:
-                    json.dump(_sanitize_for_json(harness_payload), f, indent=2)
-                print(f"📄 Saved Harness results: {args.save_harness_results}")
-            except Exception as exc:
-                print(f"⚠️ Failed to save Harness results: {exc}")
-
-        set_svd_alpha(1.0)
-
     
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
+    print(f"\n{'='*15} FINAL SUMMARY ({args.model_name} + SVD Correction) {'='*15}")
+    print(f"Model: {args.model_name}")
+    print("-" * 80)
+    print(
+        f"{'Method':<50} | {'Perplexity':<10} | {'Time (s)':<8} | {'TTFB(ms)':<10} | {'tok/s':<10}"
+    )
+    print("-" * 80)
+    svd_data = results["svd"]
+    svd_gen = svd_data.get("generation_metrics")
+    ttfb_svd_str = f"{svd_gen['ttfb_ms_median']:.1f}" if svd_gen else "-"
+    tok_s_svd_str = f"{svd_gen['tok_s_median']:.2f}" if svd_gen else "-"
+    print(
+        f"{method_label + ' + SVD Correction (α=1.0)':<50} | {svd_data['ppl']:<10.4f} | {svd_data['time']:<8.2f} | {ttfb_svd_str:<10} | {tok_s_svd_str:<10}"
+    )
+    print("=" * 80)
 
 
 if __name__ == "__main__":

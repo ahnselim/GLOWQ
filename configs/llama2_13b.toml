@@ -8,8 +8,8 @@ calibration_n_samples = 32
 # Step3 PPL dataset: wiki | c4 | ptb
 ppl_dataset = "wiki"
 
-# If true, run src/step3_decode_cache_lm.py with lm-eval-harness enabled.
-# If false, run src/step3_decode_cache_nodict_eval.py.
+# If true, run src/step3_lm_eval.py with lm-eval-harness enabled.
+# If false, run src/step3_eval_dataset.py.
 lm_harness = false
 
 # Optional runtime settings

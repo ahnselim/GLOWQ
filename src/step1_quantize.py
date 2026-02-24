@@ -1,6 +1,6 @@
 """
-triton/step1_quantize_error_integrated.py
-Computes Triton 4-bit quantization error tensors and saves original weights for downstream correction steps.
+src/step1_quantize.py
+Computes integrated Triton 4-bit quantization error tensors from original weights and saves artifacts for downstream correction.
 output :
 (user-specified output paths)
 |-- <out_quant_err>           (.pt)
@@ -102,7 +102,7 @@ if HAS_TRITON:
                     is_low_zero_nibble[:, None], packed_zeros & 0x0F, packed_zeros >> 4
                 )
             else:
-                zeros = 8
+                zeros = 8  
 
             dequant_weights = (
                 nibbles.to(tl.float32) - zeros.to(tl.float32)
@@ -371,7 +371,7 @@ def main():
         "Note: This script automatically detects layer dimensions, supporting heterogeneous attention."
     )
 
-
+    
     original_state_dict = {
         k: v.cpu().clone() for k, v in model_fp16.state_dict().items()
     }
@@ -393,7 +393,7 @@ def main():
         ):
             continue
 
-
+        
         if not any(
             kw in name
             for kw in [
@@ -401,6 +401,9 @@ def main():
                 "k_proj",
                 "v_proj",
                 "o_proj",
+                "out_proj",
+                "fc1",
+                "fc2",
                 "gate_proj",
                 "up_proj",
                 "down_proj",
@@ -408,7 +411,7 @@ def main():
         ):
             continue
 
-
+        
         layer_idx_match = re.search(r"layers\.(\d+)\.", name)
         if layer_idx_match:
             layer_num = layer_idx_match.group(1)
@@ -421,11 +424,11 @@ def main():
         Wq = get_triton_dequantized_weight(W_original, device, args.group_size)
 
         Eq = W_original.cpu() - Wq.cpu()
-        quant_err_dict[name] = Eq.to(torch.float32)
+        quant_err_dict[name] = Eq.to(torch.float32)  
 
         processed_layers += 1
 
-
+        
     print(f"\n🔍 Discovered Layer Dimensions for {args.model_name} (First 3 layers):")
     for layer_num in sorted(layer_dimensions.keys())[:3]:
         print(f"  Layer {layer_num}:")
@@ -436,7 +439,7 @@ def main():
     gc.collect()
     torch.cuda.empty_cache()
 
-
+    
     os.makedirs(os.path.dirname(args.out_quant_err) or ".", exist_ok=True)
     os.makedirs(os.path.dirname(args.out_original_weights) or ".", exist_ok=True)
     torch.save(quant_err_dict, args.out_quant_err)
@@ -450,7 +453,7 @@ def main():
         f"  Configuration: Model='{args.model_name}', group_size={args.group_size}, seed={args.seed}"
     )
 
-
+    
     if quant_err_dict:
         total_error_elements = sum(tensor.numel() for tensor in quant_err_dict.values())
         avg_error_magnitude = (

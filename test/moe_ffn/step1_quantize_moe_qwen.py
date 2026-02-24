@@ -1,6 +1,6 @@
 """
-moe_ffn/step1_quantize_error_moe_mixtral.py
-Computes fake-quantization error tensors for Mixtral MoE expert FFN weights as Step 1 of the MoE pipeline.
+moe_ffn/step1_quantize_moe_qwen.py
+Computes fake-quantization error tensors for Qwen1.5-MoE expert FFN weights as Step 1 of the MoE pipeline.
 output :
 (user-specified output paths)
 |-- <out_quant_err>           (.pt)
@@ -74,7 +74,8 @@ def fake_quantize_w4_groupwise(
 
 
 
-def is_mixtral_moe_attn_ffn_related_weight(name: str, tensor: torch.Tensor) -> bool:
+
+def is_moe_attn_ffn_related_weight(name: str, tensor: torch.Tensor) -> bool:
 
     if not (name.endswith(".weight") and tensor.ndim == 2):
         return False
@@ -83,29 +84,34 @@ def is_mixtral_moe_attn_ffn_related_weight(name: str, tensor: torch.Tensor) -> b
 
     lower = name.lower()
 
-
-    if "block_sparse_moe" in lower:
-
-        if lower.endswith("block_sparse_moe.gate.weight"):
-            return True
-
-
-        if ".experts." in lower:
-            parts = name.split(".")
-            module_name = parts[-2].lower() if len(parts) >= 2 else ""
-            if module_name in {"w1", "w2", "w3"}:
-                return True
-
+    if "experts" in lower:
+        return True
+    if ".router." in lower or lower.endswith(".router.weight"):
+        return True
 
     parts = name.split(".")
-    module_name = parts[-2].lower() if len(parts) >= 2 else ""
+    module_name = parts[-2] if len(parts) >= 2 else ""
+    module_name_lower = module_name.lower()
 
 
-    if module_name in {"q_proj", "k_proj", "v_proj", "o_proj"}:
+    if module_name_lower in {
+        "w1",
+        "w2",
+        "w3",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+        "dense_h_to_4h",
+        "dense_4h_to_h",
+    }:
         return True
 
 
-    if module_name in {"wq", "wk", "wv", "wo"}:
+    if module_name_lower in {"q_proj", "k_proj", "v_proj", "o_proj"}:
+        return True
+
+
+    if module_name_lower in {"wq", "wk", "wv", "wo"}:
         return True
 
     return False
@@ -116,13 +122,13 @@ def is_mixtral_moe_attn_ffn_related_weight(name: str, tensor: torch.Tensor) -> b
 
 def main():
     parser = argparse.ArgumentParser(
-        description="STEP 1 (Mixtral MoE only) - FakeQuant-based quantization error computation (no Triton)"
+        description="STEP 1 (Qwen1.5-MoE only) - FakeQuant-based quantization error computation (no Triton)"
     )
     parser.add_argument(
         "--model_name",
         type=str,
-        default="mistralai/Mixtral-8x7B-Instruct-v0.1",
-        help="HF model id (default: mistralai/Mixtral-8x7B-Instruct-v0.1; change if needed)",
+        default="Qwen/Qwen1.5-MoE-A2.7B-Chat",
+        help="HF model id (default: Qwen/Qwen1.5-MoE-A2.7B-Chat; change if needed)",
     )
     parser.add_argument(
         "--out_quant_err",
@@ -169,7 +175,7 @@ def main():
     parser.add_argument(
         "--trust_remote_code",
         action="store_true",
-        help="Set if needed when loading models that use custom code",
+        help="Set if needed when loading Qwen-family models",
     )
 
     args = parser.parse_args()
@@ -217,9 +223,9 @@ def main():
     targeted_names = [
         name
         for name, tensor in original_state_dict.items()
-        if is_mixtral_moe_attn_ffn_related_weight(name, tensor)
+        if is_moe_attn_ffn_related_weight(name, tensor)
     ]
-    print(f"\n🎯 Targeted Mixtral-MoE+Attention-related weights: {len(targeted_names)} tensors")
+    print(f"\n🎯 Targeted MoE-FFN+Attention-related weights: {len(targeted_names)} tensors")
 
     print(
         f"🚀 Running FakeQuant (num_bits={args.num_bits}, group_size={args.group_size}) for targeted tensors..."

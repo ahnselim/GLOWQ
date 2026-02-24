@@ -194,9 +194,9 @@ def _normalize_ppl_dataset(dataset_key: str) -> str:
 
 def run_step1(cfg: dict, paths: dict[str, Path]) -> None:
     with _step_color_output("step1"):
-        step1 = _import_src_module("step1_quantize_error_integrated")
+        step1 = _import_src_module("step1_quantize")
         argv = [
-            "step1_quantize_error_integrated.py",
+            "step1_quantize.py",
             "--model_name",
             str(_require(cfg, "model_name")),
             "--out_quant_err",
@@ -221,7 +221,7 @@ def run_step1(cfg: dict, paths: dict[str, Path]) -> None:
 
 def run_step2(cfg: dict, paths: dict[str, Path]) -> None:
     with _step_color_output("step2"):
-        step2 = _import_src_module("step2_randomized_gsvd_integrated")
+        step2 = _import_src_module("step2_rsvd")
         cov_stats_path = _cfg_get(cfg, "cov_stats_path", None)
         args = argparse.Namespace(
             model_name=str(_require(cfg, "model_name")),
@@ -286,10 +286,10 @@ def run_step3(cfg: dict, paths: dict[str, Path]) -> None:
         if lm_harness:
             if _normalize_ppl_dataset(ppl_dataset) != "wikitext2":
                 print(
-                    f"[GlowQ] Note: lm_harness=true uses step3_decode_cache_lm.py (built-in PPL eval); ppl_dataset='{ppl_dataset}' is ignored in this mode."
+                    f"[GlowQ] Note: lm_harness=true uses step3_lm_eval.py (built-in PPL eval); ppl_dataset='{ppl_dataset}' is ignored in this mode."
                 )
-            step3_lm = _import_src_module("step3_decode_cache_lm")
-            argv = ["step3_decode_cache_lm.py", *common_argv, "--enable_harness"]
+            step3_lm = _import_src_module("step3_lm_eval")
+            argv = ["step3_lm_eval.py", *common_argv, "--enable_harness"]
 
             if bool(_cfg_get(cfg, "skip_gen", False)):
                 argv.append("--skip_gen")
@@ -314,15 +314,15 @@ def run_step3(cfg: dict, paths: dict[str, Path]) -> None:
                 if value is not None:
                     argv.extend([f"--{key}", str(value)])
 
-            print("\n[GlowQ] Step3 start: step3_decode_cache_lm.py (lm-eval-harness enabled)")
+            print("\n[GlowQ] Step3 start: step3_lm_eval.py (lm-eval-harness enabled)")
             with _temporary_argv(argv):
                 step3_lm.main()
             print("[GlowQ] Step3 done")
             return
 
-        step3_eval = _import_src_module("step3_decode_cache_nodict_eval")
+        step3_eval = _import_src_module("step3_eval_dataset")
         argv = [
-            "step3_decode_cache_nodict_eval.py",
+            "step3_eval_dataset.py",
             *common_argv,
             "--eval_dataset",
             _normalize_ppl_dataset(ppl_dataset),
@@ -352,7 +352,7 @@ def run_step3(cfg: dict, paths: dict[str, Path]) -> None:
                 argv.extend([f"--{key}", str(value)])
 
         print(
-            f"\n[GlowQ] Step3 start: step3_decode_cache_nodict_eval.py (ppl_dataset={ppl_dataset})"
+            f"\n[GlowQ] Step3 start: step3_eval_dataset.py (ppl_dataset={ppl_dataset})"
         )
         with _temporary_argv(argv):
             step3_eval.main()

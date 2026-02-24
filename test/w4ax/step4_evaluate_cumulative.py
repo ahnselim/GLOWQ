@@ -20,7 +20,7 @@ import torch
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from step3_eval_integrated import (
+from step3_evaluate import (
     apply_activation_fake_quant,
     apply_quantized_weights,
     evaluate,

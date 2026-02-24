@@ -1,15 +1,17 @@
-#!/usr/bin/env python3
 """
-src/step2_randomized_gsvd_integrated.py
-Builds shared low-rank GSVD artifacts (A/B factors and B-reference map) from quantization errors.
+moe_ffn/step2_rsvd_layerwise.py
+Performs layer-wise randomized GSVD for MoE FFN quantization error tensors without Shared-B grouping.
 output :
-<output_path>/   (required)
+<output_path>/
 |-- low_rank_shared.pt
 `-- b_ref_map.json
+<cov_stats_path> (optional cache .pt)
 """
+
 import os
 import re
 import json
+import math
 import torch
 import argparse
 import logging
@@ -19,7 +21,10 @@ from collections import defaultdict
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 
-logger = logging.getLogger("RandomizedGSVD_Integrated")
+
+
+
+logger = logging.getLogger("RandomizedGSVD_Layerwise")
 logger.setLevel(logging.INFO)
 ch = logging.StreamHandler()
 ch.setLevel(logging.INFO)
@@ -40,9 +45,6 @@ def extract_layer_index(name: str) -> str:
     return m.group(1) if m else "unknown"
 
 
-SUFFIX_ORDER = {"q_proj": 0, "k_proj": 1, "v_proj": 2, "gate_proj": 0, "up_proj": 1}
-
-
 def str2bool(value) -> bool:
     if isinstance(value, bool):
         return value
@@ -61,39 +63,6 @@ def resolve_torch_dtype(name: str) -> torch.dtype:
         raise argparse.ArgumentTypeError(f"Unsupported torch dtype '{name}'") from err
 
 
-def build_groups(
-    err_T: Dict[str, torch.Tensor], model_name: str
-) -> Dict[str, List[str]]:
-    layer_groups = defaultdict(list)
-    layer_dimensions = defaultdict(dict)
-
-    for name in err_T:
-        parts = name.split(".")
-        if len(parts) < 3:
-            continue
-
-        module_name = parts[-2]
-        layer_idx = extract_layer_index(name)
-        layer_dimensions[layer_idx][module_name] = err_T[name].shape
-
-        if module_name in ("q_proj", "k_proj", "v_proj"):
-            key = f"layer{layer_idx}_qkv"
-            layer_groups[key].append(name)
-        elif module_name in ("gate_proj", "up_proj"):
-            key = f"layer{layer_idx}_mlp"
-            layer_groups[key].append(name)
-
-    for gk, names in layer_groups.items():
-        names.sort(key=lambda n: SUFFIX_ORDER.get(n.split(".")[-2], 99))
-
-    logger.info(f"Total groups created for Shared-B processing: {len(layer_groups)}")
-
-    for layer_idx, dims in list(layer_dimensions.items())[:3]:
-        if dims:
-            logger.info(f"Layer {layer_idx} dimensions ({model_name} No SmoothQuant):")
-            for module, shape in sorted(dims.items()):
-                logger.info(f"  {module}: {shape}")
-    return layer_groups
 
 
 
@@ -137,9 +106,11 @@ def build_calibration_tokens(
         text = (row.get("text") or "").strip()
         if not text:
             continue
-        ids = tokenizer(
-            text, return_tensors="pt", add_special_tokens=False
-        ).input_ids[0].tolist()
+        ids = (
+            tokenizer(text, return_tensors="pt", add_special_tokens=False)
+            .input_ids[0]
+            .tolist()
+        )
         if not ids:
             continue
         if eos_id is not None:
@@ -164,6 +135,39 @@ def build_calibration_tokens(
         if samples
         else torch.empty(0, seqlen, dtype=torch.long)
     )
+
+
+
+
+
+def build_module_to_group_map(model_name: str) -> Dict[str, str]:
+
+    name_lower = model_name.lower()
+    is_opt = "opt" in name_lower
+    is_llama_family = any(
+        kw in name_lower for kw in ["llama", "vicuna", "qwen", "phi"]
+    )
+
+    if is_opt:
+        return {"q_proj": "qkv", "k_proj": "qkv", "v_proj": "qkv"}
+    elif is_llama_family:
+        return {
+            "q_proj": "qkv",
+            "k_proj": "qkv",
+            "v_proj": "qkv",
+            "gate_proj": "mlp",
+            "up_proj": "mlp",
+        }
+    else:
+        return {
+            "q_proj": "qkv",
+            "k_proj": "qkv",
+            "v_proj": "qkv",
+            "gate_proj": "mlp",
+            "up_proj": "mlp",
+            "fc1": "mlp",
+            "fc2": "mlp",
+        }
 
 
 @torch.no_grad()
@@ -196,32 +200,7 @@ def estimate_input_covariance(
     stats: Dict[str, dict] = {}
     handles = []
 
-    name_lower = model_name.lower()
-    is_opt = "opt" in name_lower
-    is_llama_family = any(
-        kw in name_lower for kw in ["llama", "vicuna", "mistral", "qwen", "phi"]
-    )
-
-    if is_opt:
-        module_to_group_map = {"q_proj": "qkv", "k_proj": "qkv", "v_proj": "qkv"}
-    elif is_llama_family:
-        module_to_group_map = {
-            "q_proj": "qkv",
-            "k_proj": "qkv",
-            "v_proj": "qkv",
-            "gate_proj": "mlp",
-            "up_proj": "mlp",
-        }
-    else:
-        module_to_group_map = {
-            "q_proj": "qkv",
-            "k_proj": "qkv",
-            "v_proj": "qkv",
-            "gate_proj": "mlp",
-            "up_proj": "mlp",
-            "fc1": "mlp",
-            "fc2": "mlp",
-        }
+    module_to_group_map = build_module_to_group_map(model_name)
 
     def get_hook(name: str):
         def hook(module, inp, _out):
@@ -231,14 +210,21 @@ def estimate_input_covariance(
             module_suffix = parts[-1]
             layer_idx = extract_layer_index(name)
             group_type = module_to_group_map.get(module_suffix)
-            key = f"layer{layer_idx}_{group_type}" if group_type in ("qkv", "mlp") else name
+
+            key = (
+                f"layer{layer_idx}_{group_type}"
+                if group_type in ("qkv", "mlp")
+                else name
+            )
 
             if key not in stats:
                 stats[key] = stat_slot(dim)
 
             x_mm = x.to(matmul_dtype)
             stats[key]["xtx"].add_((x_mm.T @ x_mm).to(device=cov_device))
-            stats[key]["sumx"].add_(x.sum(dim=0).to(dtype=torch.float64, device=cov_device))
+            stats[key]["sumx"].add_(
+                x.sum(dim=0).to(dtype=torch.float64, device=cov_device)
+            )
             stats[key]["n"] += x.shape[0]
 
         return hook
@@ -301,6 +287,9 @@ def calculate_matrix_sqrt_and_inv_sqrt(
     return S_sqrt.cpu(), S_inv_sqrt.cpu()
 
 
+
+
+
 def randomized_svd_pytorch(
     M: torch.Tensor,
     rank: int,
@@ -333,6 +322,8 @@ def process_randomized_gsvd_group(
     n_oversamples: int,
     n_power_iters: int,
 ) -> Tuple[List[torch.Tensor], torch.Tensor]:
+
+
     E_cat = torch.cat(E_list, dim=0).to(device, dtype=torch.float32)
     W_sqrt = Sigma_sqrt.to(device, dtype=torch.float32)
 
@@ -343,7 +334,12 @@ def process_randomized_gsvd_group(
             "QR decomposition failed. Falling back to standard Right-Weighted SVD."
         )
         return process_weighted_svd_group(
-            E_list, names, Sigma_sqrt, Sigma_inv_sqrt, rank, device
+            E_list,
+            names,
+            Sigma_sqrt,
+            Sigma_inv_sqrt,
+            rank,
+            device,
         )
 
     M = R_e @ W_sqrt
@@ -354,6 +350,7 @@ def process_randomized_gsvd_group(
     U = Q_e @ U_m
     S_sqrt_diag = torch.sqrt(S_vals).diag()
 
+
     cumulative_rows = 0
     A_final_list = []
     for E_tensor in E_list:
@@ -362,6 +359,7 @@ def process_randomized_gsvd_group(
         A_i = (U_slice @ S_sqrt_diag).cpu()
         A_final_list.append(A_i)
         cumulative_rows += rows
+
 
     B_temp = S_sqrt_diag @ Vh
     W_inv_sqrt = Sigma_inv_sqrt.to(device, dtype=torch.float32)
@@ -379,8 +377,13 @@ def process_weighted_svd_group(
     rank: int,
     device: torch.device,
 ) -> Tuple[List[torch.Tensor], torch.Tensor]:
+
     W_sqrt = Sigma_sqrt.to(device, dtype=torch.float32)
-    E_tilde_list = [E.to(device, dtype=torch.float32) @ W_sqrt for E in E_list]
+    E_tilde_list = []
+    for E in E_list:
+        E_tilde = E.to(device, dtype=torch.float32) @ W_sqrt
+        E_tilde_list.append(E_tilde)
+
     E_tilde_cat = torch.cat(E_tilde_list, dim=0)
     U, S_vals, Vh = torch.linalg.svd(E_tilde_cat, full_matrices=False)
 
@@ -398,6 +401,34 @@ def process_weighted_svd_group(
     W_inv_sqrt = Sigma_inv_sqrt.to(device, dtype=torch.float32)
     B_shared_final = (B_temp @ W_inv_sqrt).cpu()
     return A_final_list, B_shared_final
+
+
+
+
+
+
+def get_cov_key_for_weight(weight_name: str, model_name: str) -> str:
+
+    if not weight_name.endswith(".weight"):
+        return weight_name
+
+    parts = weight_name.split(".")
+    if len(parts) < 3:
+        return weight_name.replace(".weight", "")
+
+    module_suffix = parts[-2]
+    layer_idx = extract_layer_index(weight_name)
+    module_to_group_map = build_module_to_group_map(model_name)
+    group_type = module_to_group_map.get(module_suffix)
+
+    if group_type in ("qkv", "mlp"):
+        return f"layer{layer_idx}_{group_type}"
+
+
+    return weight_name.replace(".weight", "")
+
+
+
 
 
 def main(args):
@@ -445,68 +476,42 @@ def main(args):
         )
         if args.cov_stats_path:
             os.makedirs(os.path.dirname(args.cov_stats_path) or ".", exist_ok=True)
-            torch.save({k: v.cpu() for k, v in cov_matrices.items()}, args.cov_stats_path)
+            torch.save(
+                {k: v.cpu() for k, v in cov_matrices.items()}, args.cov_stats_path
+            )
 
     del model
     torch.cuda.empty_cache()
 
-    sqrt_matrices = {}
+    sqrt_matrices: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
     for name, cov in tqdm(cov_matrices.items(), desc="Calculating Matrix Square Roots"):
         sqrt_matrices[name] = calculate_matrix_sqrt_and_inv_sqrt(cov, device)
-
-    layer_groups = build_groups(err_T, args.model_name)
 
     shared: Dict[str, torch.Tensor] = {}
     b_ref_map: Dict[str, str] = {}
 
     logger.info(
-        f"Starting Randomized GSVD processing for rank={args.max_rank} on {args.model_name}..."
+        f"Starting Layerwise Randomized GSVD processing for rank={args.max_rank} on {args.model_name}..."
     )
 
-    for gk, names in tqdm(
-        layer_groups.items(), desc="Processing Shared-B Groups with Randomized GSVD"
-    ):
-        if gk not in sqrt_matrices:
-            logger.warning(f"Covariance matrix not found for group {gk}. Skipping.")
+
+    for name in tqdm(sorted(err_T.keys()), desc="Processing Layerwise GSVD"):
+        if "layers" not in name:
+
             continue
 
-        Sigma_sqrt, Sigma_inv_sqrt = sqrt_matrices[gk]
-        E_list = [err_T[n] for n in names]
-
-        A_list, B_shared = process_randomized_gsvd_group(
-            E_list,
-            names,
-            Sigma_sqrt,
-            Sigma_inv_sqrt,
-            args.max_rank,
-            device,
-            args.oversamples,
-            args.power_iters,
-        )
-
-        b_key_shared = f"{gk}.B_shared"
-        shared[b_key_shared] = B_shared.to(torch.float16)
-
-        for i, name in enumerate(names):
-            module_suffix = name.split(".")[-2]
-            a_key = f"{gk}.{module_suffix}.A"
-            shared[a_key] = A_list[i].to(torch.float16)
-            b_ref_map[name] = b_key_shared
-
-    grouped_names = {n for names in layer_groups.values() for n in names}
-    solo_names = sorted([n for n in err_T if n not in grouped_names and "layers" in n])
-
-    for name in tqdm(solo_names, desc="Processing Solo Layers with Randomized GSVD"):
-        module_name = name.replace(".weight", "")
-        if module_name not in sqrt_matrices:
+        cov_key = get_cov_key_for_weight(name, args.model_name)
+        if cov_key not in sqrt_matrices:
             logger.warning(
-                f"Covariance matrix not found for solo layer {module_name}. Skipping."
+                f"Covariance matrix not found for weight {name} (cov_key={cov_key}). Skipping."
             )
             continue
 
-        Sigma_sqrt, Sigma_inv_sqrt = sqrt_matrices[module_name]
+        Sigma_sqrt, Sigma_inv_sqrt = sqrt_matrices[cov_key]
+        E_tensor = err_T[name]
+
         A_list, B = process_randomized_gsvd_group(
-            [err_T[name]],
+            [E_tensor],
             [name],
             Sigma_sqrt,
             Sigma_inv_sqrt,
@@ -516,10 +521,15 @@ def main(args):
             args.power_iters,
         )
 
-        a_key, b_key = f"{module_name}.A", f"{module_name}.B"
-        shared[a_key] = A_list[0].to(torch.float16)
+        A = A_list[0]
+
+        base_name = name.replace(".weight", "")
+        a_key, b_key = f"{base_name}.A", f"{base_name}.B"
+
+        shared[a_key] = A.to(torch.float16)
         shared[b_key] = B.to(torch.float16)
         b_ref_map[name] = b_key
+
 
     os.makedirs(args.output_path, exist_ok=True)
     torch.save(shared, os.path.join(args.output_path, "low_rank_shared.pt"))
@@ -529,12 +539,14 @@ def main(args):
     logger.info(f"\nSaved artifacts to {args.output_path}")
     logger.info(f"  - low_rank_shared.pt: {len(shared)} tensors")
     logger.info(f"  - b_ref_map.json: {len(b_ref_map)} mappings")
-    logger.info(f"\nRandomized GSVD processing complete for {args.model_name}.")
+    logger.info(
+        f"\nLayerwise Randomized GSVD processing complete for {args.model_name}."
+    )
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(
-        "STEP 2 (Integrated) - Randomized GSVD with Shared-B Grouping (FIXED)"
+        "STEP 2 (Layerwise) - Randomized GSVD without Shared-B Grouping"
     )
     p.add_argument(
         "--model_name",
@@ -569,7 +581,7 @@ if __name__ == "__main__":
     p.add_argument(
         "--nsamples",
         type=int,
-        default=64,
+        default=128,
         help="Number of calibration samples for covariance estimation.",
     )
     p.add_argument(
@@ -626,5 +638,6 @@ if __name__ == "__main__":
         default="float32",
         help="Torch dtype name used for XtX accumulation (e.g., float32, float16).",
     )
+
     args = p.parse_args()
     main(args)

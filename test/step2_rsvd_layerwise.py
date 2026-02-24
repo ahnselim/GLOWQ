@@ -1,5 +1,5 @@
 """
-step2_randomized_gsvd_layerwise.py
+step2_rsvd_layerwise.py
 Runs layer-wise streaming randomized SVD/GSVD on quantization error tensors using calibration covariance statistics.
 output :
 <output_path>/
