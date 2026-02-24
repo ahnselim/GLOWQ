@@ -65,6 +65,17 @@ def _require(cfg: dict, key: str):
     return val
 
 
+def _importance_metrics_cfg(cfg: dict) -> str:
+    for key in ("importance_metric", "importance_metrics", "restoration_importance_metrics"):
+        val = _cfg_get(cfg, key)
+        if val is None:
+            continue
+        if isinstance(val, (list, tuple)):
+            return ",".join(str(x) for x in val)
+        return str(val)
+    return "gsvd,norm_error"
+
+
 def _ensure_restoration_on_path() -> None:
     for p in (RESTORATION_DIR, SRC_DIR):
         ps = str(p)
@@ -114,6 +125,11 @@ def _import_restoration_module(name: str):
     return importlib.import_module(name)
 
 
+def _import_src_module(name: str):
+    _ensure_restoration_on_path()
+    return importlib.import_module(name)
+
+
 def _build_paths(cfg: dict, config_stem: str) -> dict[str, Path]:
     base_output = _cfg_get(cfg, "restoration_output_dir")
     if base_output is None:
@@ -157,9 +173,9 @@ def _build_paths(cfg: dict, config_stem: str) -> dict[str, Path]:
 
 def run_step1(cfg: dict, paths: dict[str, Path]) -> None:
     with _step_color_output("step1"):
-        mod = _import_restoration_module("step1_quantize_error")
+        mod = _import_src_module("step1_quantize_error_integrated")
         argv = [
-            "step1_quantize_error.py",
+            "step1_quantize_error_integrated.py",
             "--model_name",
             str(_require(cfg, "model_name")),
             "--out_quant_err",
@@ -176,7 +192,7 @@ def run_step1(cfg: dict, paths: dict[str, Path]) -> None:
         if bool(_cfg_get(cfg, "trust_remote_code", False)):
             argv.append("--trust_remote_code")
 
-        print("\n[GlowQ-S] Step1 start: restoration quantization error")
+        print("\n[GlowQ-S] Step1 start: quantization error extraction (src)")
         with _temporary_argv(argv):
             mod.main()
         print("[GlowQ-S] Step1 done")
@@ -184,7 +200,12 @@ def run_step1(cfg: dict, paths: dict[str, Path]) -> None:
 
 def run_step2(cfg: dict, paths: dict[str, Path]) -> None:
     with _step_color_output("step2"):
-        mod = _import_restoration_module("step2_randomized_gsvd")
+        mod = _import_src_module("step2_randomized_gsvd_integrated")
+        cov_stats_path = _cfg_get(
+            cfg,
+            "restoration_cov_stats_path",
+            _cfg_get(cfg, "cov_stats_path", None),
+        )
         args = argparse.Namespace(
             model_name=str(_require(cfg, "model_name")),
             err_path=str(paths["quant_err_path"]),
@@ -195,15 +216,26 @@ def run_step2(cfg: dict, paths: dict[str, Path]) -> None:
             seqlen=int(_cfg_get(cfg, "restoration_calibration_seq_len", _cfg_get(cfg, "calibration_seq_len", 2048))),
             shrinkage_alpha=float(_cfg_get(cfg, "restoration_shrinkage_alpha", 0.05)),
             calib_dataset=str(_cfg_get(cfg, "restoration_calibration_dataset", _cfg_get(cfg, "calibration_dataset", "DKYoon/SlimPajama-6B"))),
-            calib_config=_cfg_get(cfg, "restoration_calibration_config", None),
-            cov_store_device=str(_cfg_get(cfg, "restoration_cov_store_device", "cpu")),
-            stream_center=bool(_cfg_get(cfg, "restoration_stream_center", False)),
-            use_tf32=bool(_cfg_get(cfg, "restoration_use_tf32", False)),
-            oversamples=int(_cfg_get(cfg, "restoration_oversamples", 10)),
-            power_iters=int(_cfg_get(cfg, "restoration_power_iters", 2)),
+            calib_config=_cfg_get(
+                cfg,
+                "restoration_calibration_dataset_config",
+                _cfg_get(cfg, "calibration_dataset_config", _cfg_get(cfg, "calib_config", None)),
+            ),
+            cov_store_device=str(
+                _cfg_get(cfg, "restoration_cov_store_device", _cfg_get(cfg, "cov_store_device", "cpu"))
+            ),
+            oversamples=int(_cfg_get(cfg, "restoration_oversamples", _cfg_get(cfg, "oversamples", 10))),
+            power_iters=int(_cfg_get(cfg, "restoration_power_iters", _cfg_get(cfg, "power_iters", 2))),
+            cov_stats_path=(str(cov_stats_path) if cov_stats_path is not None else None),
+            reuse_cov_stats=bool(
+                _cfg_get(cfg, "restoration_reuse_cov_stats", _cfg_get(cfg, "reuse_cov_stats", False))
+            ),
+            matmul_dtype=str(
+                _cfg_get(cfg, "restoration_matmul_dtype", _cfg_get(cfg, "matmul_dtype", "float32"))
+            ),
         )
 
-        print("\n[GlowQ-S] Step2 start: restoration randomized GSVD")
+        print("\n[GlowQ-S] Step2 start: randomized GSVD (src integrated)")
         print(
             f"[GlowQ-S] Step2 config: rank={args.max_rank}, calib_dataset={args.calib_dataset}, nsamples={args.nsamples}"
         )
@@ -221,8 +253,15 @@ def run_step3_1(cfg: dict, paths: dict[str, Path]) -> None:
             shared_path=str(paths["shared_path"]),
             bmap_path=str(paths["bmap_path"]),
             output_json=str(_cfg_get(cfg, "restoration_rankings_json", paths["rankings_json"])),
+            metrics=_importance_metrics_cfg(cfg),
+            include_component_rankings=bool(
+                _cfg_get(cfg, "restoration_include_component_rankings", True)
+            ),
+            include_layer_order=bool(_cfg_get(cfg, "restoration_include_layer_order", True)),
+            device=str(_cfg_get(cfg, "device", "auto")),
         )
         print("\n[GlowQ-S] Step3_1 start: calculate importance rankings")
+        print(f"[GlowQ-S] Step3_1 metrics: {args.metrics}")
         mod.main(args)
         print("[GlowQ-S] Step3_1 done")
         paths["rankings_json"] = Path(args.output_json)

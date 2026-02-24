@@ -39,6 +39,20 @@ except Exception:
         "Triton is not available or disabled. If needed, install with 'pip install triton'."
     )
 
+
+def _safe_cuda_empty_cache(context: str) -> bool:
+    if not torch.cuda.is_available():
+        return True
+    try:
+        torch.cuda.empty_cache()
+        return True
+    except Exception as exc:
+        print(
+            f"[WARN] torch.cuda.empty_cache() failed during {context}; continuing without cache clear. Error: {exc}"
+        )
+        return False
+
+
 if HAS_TRITON:
 
     @triton.jit
@@ -300,7 +314,7 @@ if HAS_TRITON:
                 new_module = TritonTrue4BitLinear.from_float(module, group_size)
                 setattr(parent, attr_name, new_module)
         gc.collect()
-        torch.cuda.empty_cache()
+        _safe_cuda_empty_cache("convert_to_triton_4bit")
         return model
 
 
@@ -978,7 +992,7 @@ def main():
         del model_fp16, original_weights
     gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        _safe_cuda_empty_cache("step3 main teardown")
 
     
     print(

@@ -193,7 +193,23 @@ def main(args):
     os.makedirs(args.output_dir, exist_ok=True)
 
     with open(args.rankings_json, "r") as f:
-        rankings = json.load(f)
+        loaded_rankings = json.load(f)
+
+    rankings = {}
+    skipped_keys = []
+    for key, value in loaded_rankings.items():
+        if isinstance(value, list) and all(isinstance(x, str) for x in value):
+            rankings[key] = value
+        else:
+            skipped_keys.append(key)
+
+    if skipped_keys:
+        print(f"Skipping non-evaluation ranking keys: {skipped_keys}")
+    if not rankings:
+        raise ValueError(
+            f"No evaluable ranking lists found in {args.rankings_json}. "
+            "Expected top-level metric -> [group keys] entries."
+        )
 
     results = []
 
@@ -300,5 +316,3 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     main(args)
-
-

@@ -1,6 +1,8 @@
 # GlowQ: Group-Shared LOw-Rank Approximation for Quantized LLMs
 
-GlowQ is a low-rank correction method for quantized LLMs that reduces the latency and memory overhead of conventional per-layer restoration by sharing and caching a single right-factor projection across modules that consume the same input (e.g., QKV or MLP groups). GlowQ-S is a selective variant that applies these cached shared corrections only to the groups/layers with the highest accuracy benefit, preserving most of the quality gains while further improving inference efficiency.
+GlowQ is a low-rank correction method for quantized LLMs that reduces the latency and memory overhead of conventional per-layer restoration by sharing and caching a single right-factor projection across modules that consume the same input (e.g., QKV or MLP groups).
+
+GlowQ-S is a selective variant that applies these cached shared corrections only to the groups/layers with the highest accuracy benefit, preserving most of the quality gains while further improving inference efficiency.
 
 ## Installation
 
@@ -146,6 +148,11 @@ Run with:
 python run_glowq_s.py configs/qwen_2_5_7b.toml
 ```
 
+Recent update:
+
+- `step3_1` importance ranking now supports configurable metrics from TOML via `importance_metric`.
+- Default metrics are `gsvd,norm_error` (GSVD score + normalized error ratio).
+
 ## Configuration
 
 Config templates are in `./configs/`.
@@ -169,8 +176,31 @@ Typical fields include:
 - `use_cuda_w4a16`
 - `trust_remote_code`
 - `output_dir`
+- `glowq_s` (optional; marker flag for restoration pipeline configs)
+- `importance_metric` (optional; used by `run_glowq_s.py` Step3_1)
 
 To use the custom CUDA W4A16 kernel path in Step3, set `use_cuda_w4a16 = true` in your config (TOML). If this is `false`, GlowQ uses the default Triton 4-bit path (or FP16 fallback when Triton is unavailable).
+
+### GlowQ-S Importance Metrics (Step3_1)
+
+`run_glowq_s.py` reads `importance_metric` from the TOML config and passes it to `src/restoration/step3_1_calculate_importance.py`.
+
+Default:
+
+```toml
+glowq_s = true
+importance_metric = "gsvd,norm_error"
+```
+
+Supported metrics (comma-separated):
+
+- `gsvd`
+- `norm_error`
+- `frobenius_norm_error`
+- `cosine_similarity`
+- `layer_order`
+
+Useful aliases are also accepted (for example: `norm`, `normalized`, `fro`, `cosine`, `layer`).
 
 ### LM Harness Mode
 
@@ -249,7 +279,7 @@ python run_glowq_s.py qwen_2_5_7b.toml
 @inproceedings{
 an2026glowq,
 title={GlowQ: Group-Shared {LO}w-Rank Approximation for Quantized {LLM}s},
-author={Selim An and Yeseong Kim and Il hong Suh},
+author={Selim An and Il hong Suh and Yeseong Kim},
 booktitle={The Fourteenth International Conference on Learning Representations},
 year={2026},
 url={https://openreview.net/forum?id=kVojSLUcvS}

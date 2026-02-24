@@ -20,6 +20,14 @@ trust_remote_code = true
 calibration_seq_len = 2048
 output_dir = "outputs/qwen_2_5_7b"
 
+# GlowQ-S restoration pipeline (run_glowq_s.py)
+# Set true when using the restoration pipeline config flow.
+glowq_s = false
+# Step3_1 importance metrics (comma-separated). Default uses GSVD + normalized error.
+# Available: gsvd, norm_error, frobenius_norm_error, cosine_similarity, layer_order
+# Aliases: norm, normalized, fro, cosine, layer
+importance_metric = "gsvd,norm_error"
+
 # Optional step3 settings
 skip_gen = false
 eval_max_docs = 64

@@ -1,27 +1,23 @@
+#!/usr/bin/env python3
 """
 src/step2_randomized_gsvd_integrated.py
-Estimates activation covariances and builds randomized GSVD Shared-B low-rank correction artifacts from step1 errors.
+Builds shared low-rank GSVD artifacts (A/B factors and B-reference map) from quantization errors.
 output :
-<output_path>/
-|-- low_rank_shared.pt    (shared low-rank tensors)
-`-- b_ref_map.json        (module-to-shared-B mapping)
-(optional)
+<output_path>/   (required)
+|-- low_rank_shared.pt
+`-- b_ref_map.json
 """
-
 import os
 import re
 import json
 import torch
 import argparse
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple, Optional
 from tqdm import tqdm
 from collections import defaultdict
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
-
-
-
 
 logger = logging.getLogger("RandomizedGSVD_Integrated")
 logger.setLevel(logging.INFO)
@@ -45,6 +41,24 @@ def extract_layer_index(name: str) -> str:
 
 
 SUFFIX_ORDER = {"q_proj": 0, "k_proj": 1, "v_proj": 2, "gate_proj": 0, "up_proj": 1}
+
+
+def str2bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    value = str(value).strip().lower()
+    if value in ("true", "1", "yes", "y", "on"):
+        return True
+    if value in ("false", "0", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"Expected boolean value, got '{value}'")
+
+
+def resolve_torch_dtype(name: str) -> torch.dtype:
+    try:
+        return getattr(torch, name)
+    except AttributeError as err:
+        raise argparse.ArgumentTypeError(f"Unsupported torch dtype '{name}'") from err
 
 
 def build_groups(
@@ -74,50 +88,158 @@ def build_groups(
 
     logger.info(f"Total groups created for Shared-B processing: {len(layer_groups)}")
 
-    
     for layer_idx, dims in list(layer_dimensions.items())[:3]:
         if dims:
-            logger.info(f"Layer {layer_idx} dimensions ({model_name} ):")
+            logger.info(f"Layer {layer_idx} dimensions ({model_name} No SmoothQuant):")
             for module, shape in sorted(dims.items()):
                 logger.info(f"  {module}: {shape}")
     return layer_groups
 
 
 
+def build_calibration_tokens(
+    tokenizer,
+    nsamples: int = 64,
+    seqlen: int = 2048,
+    dataset_name: str = "wikitext",
+    dataset_config: Optional[str] = None,
+) -> torch.Tensor:
+    logger.info(
+        f"Building calibration tokens (dataset={dataset_name}, nsamples={nsamples}, seqlen={seqlen})"
+    )
+
+    try:
+        ds = load_dataset(
+            dataset_name,
+            name=dataset_config,
+            split="train",
+            streaming=True,
+        )
+    except Exception:
+        ds = load_dataset(dataset_name, name=dataset_config, split="train")
+
+    sample_budget = max(nsamples * 5, nsamples)
+    if hasattr(ds, "take"):
+        iterator = ds.take(sample_budget)
+    else:
+        total = len(ds)
+        subset = min(sample_budget, total)
+        iterator = ds.select(range(subset))
+
+    eos_id = tokenizer.eos_token_id or tokenizer.pad_token_id
+    if eos_id is None and getattr(tokenizer, "eos_token", None):
+        eos_id = tokenizer.convert_tokens_to_ids(tokenizer.eos_token)
+
+    token_buffer: List[int] = []
+    samples: List[torch.Tensor] = []
+
+    for row in iterator:
+        text = (row.get("text") or "").strip()
+        if not text:
+            continue
+        ids = tokenizer(
+            text, return_tensors="pt", add_special_tokens=False
+        ).input_ids[0].tolist()
+        if not ids:
+            continue
+        if eos_id is not None:
+            ids.append(eos_id)
+        token_buffer.extend(ids)
+
+        while len(token_buffer) >= seqlen and len(samples) < nsamples:
+            samples.append(torch.tensor(token_buffer[:seqlen], dtype=torch.long))
+            token_buffer = token_buffer[seqlen:]
+            if len(samples) >= nsamples:
+                break
+        if len(samples) >= nsamples:
+            break
+
+    if len(samples) < nsamples:
+        logger.warning(
+            f"Collected only {len(samples)}/{nsamples} sequences from {dataset_name}."
+        )
+
+    return (
+        torch.stack(samples, dim=0)
+        if samples
+        else torch.empty(0, seqlen, dtype=torch.long)
+    )
 
 
 @torch.no_grad()
 def estimate_input_covariance(
     model,
     tokenizer,
-    device,
-    model_name,
-    nsamples=32,
-    seqlen=2048,
-    alpha=0.05,
-    calibration_dataset="DKYoon/SlimPajama-6B",
+    device: torch.device,
+    model_name: str,
+    nsamples: int = 64,
+    seqlen: int = 2048,
+    alpha: float = 0.05,
+    calib_dataset: str = "wikitext",
+    calib_config: Optional[str] = None,
+    cov_store_device: str = "cpu",
+    matmul_dtype: torch.dtype = torch.float32,
 ) -> Dict[str, torch.Tensor]:
     logger.info(
-        f"Collecting input activations for {model_name} to estimate covariance matrices ..."
+        f"Collecting input activations for {model_name} (nsamples={nsamples}, seqlen={seqlen})"
     )
-    inputs = defaultdict(list)
+
+    cov_device = torch.device(cov_store_device)
+
+    def stat_slot(dim: int):
+        return {
+            "xtx": torch.zeros(dim, dim, dtype=torch.float32, device=cov_device),
+            "sumx": torch.zeros(dim, dtype=torch.float64, device=cov_device),
+            "n": 0,
+        }
+
+    stats: Dict[str, dict] = {}
     handles = []
 
-    module_to_group_map = {
-        "q_proj": "qkv",
-        "k_proj": "qkv",
-        "v_proj": "qkv",
-        "o_proj": "qkv_out",
-        "gate_proj": "mlp",
-        "up_proj": "mlp",
-        "down_proj": "mlp_out",
-    }
+    name_lower = model_name.lower()
+    is_opt = "opt" in name_lower
+    is_llama_family = any(
+        kw in name_lower for kw in ["llama", "vicuna", "mistral", "qwen", "phi"]
+    )
 
-    def get_hook(name):
-        def hook(module, inp, out):
-            x = inp[0].detach()
-            weight_key = f"{name}.weight"
-            inputs[weight_key].append(x.reshape(-1, x.shape[-1]).cpu())
+    if is_opt:
+        module_to_group_map = {"q_proj": "qkv", "k_proj": "qkv", "v_proj": "qkv"}
+    elif is_llama_family:
+        module_to_group_map = {
+            "q_proj": "qkv",
+            "k_proj": "qkv",
+            "v_proj": "qkv",
+            "gate_proj": "mlp",
+            "up_proj": "mlp",
+        }
+    else:
+        module_to_group_map = {
+            "q_proj": "qkv",
+            "k_proj": "qkv",
+            "v_proj": "qkv",
+            "gate_proj": "mlp",
+            "up_proj": "mlp",
+            "fc1": "mlp",
+            "fc2": "mlp",
+        }
+
+    def get_hook(name: str):
+        def hook(module, inp, _out):
+            x = inp[0].detach().reshape(-1, inp[0].shape[-1])
+            dim = x.shape[-1]
+            parts = name.split(".")
+            module_suffix = parts[-1]
+            layer_idx = extract_layer_index(name)
+            group_type = module_to_group_map.get(module_suffix)
+            key = f"layer{layer_idx}_{group_type}" if group_type in ("qkv", "mlp") else name
+
+            if key not in stats:
+                stats[key] = stat_slot(dim)
+
+            x_mm = x.to(matmul_dtype)
+            stats[key]["xtx"].add_((x_mm.T @ x_mm).to(device=cov_device))
+            stats[key]["sumx"].add_(x.sum(dim=0).to(dtype=torch.float64, device=cov_device))
+            stats[key]["n"] += x.shape[0]
 
         return hook
 
@@ -125,184 +247,73 @@ def estimate_input_covariance(
         if isinstance(module, torch.nn.Linear):
             handles.append(module.register_forward_hook(get_hook(name)))
 
-    
-    logger.info(
-        f"Loading calibration dataset '{calibration_dataset}' with streaming..."
-    )
-    calib_data_stream = load_dataset(calibration_dataset, split="train", streaming=True)
-
-    samples = []
-    token_buf = []
-
-    for data in tqdm(calib_data_stream, desc="Processing calibration data stream"):
-        if len(samples) >= nsamples:
-            break
-
-        line = data.get("text", "").strip()
-        if not line:
-            continue
-
-        tokens = tokenizer.encode(line)
-        token_buf.extend(tokens)
-
-        while len(token_buf) >= seqlen:
-            if len(samples) >= nsamples:
-                break
-
-            chunk = token_buf[:seqlen]
-            samples.append(torch.tensor(chunk))
-            token_buf = token_buf[seqlen:]
-
-    if not samples:
-        raise ValueError(
-            "Could not create any calibration samples. Check dataset or parameters."
-        )
-
-    calib_tokens = torch.stack(samples)
-    logger.info(
-        f"Created {calib_tokens.shape[0]} calibration samples of sequence length {seqlen}."
+    tokens = build_calibration_tokens(
+        tokenizer,
+        nsamples=nsamples,
+        seqlen=seqlen,
+        dataset_name=calib_dataset,
+        dataset_config=calib_config,
     )
 
-    for i in tqdm(range(calib_tokens.shape[0]), desc="Calibration Forward Pass"):
-        model(calib_tokens[i : i + 1].to(device))
+    if tokens.numel() == 0:
+        for h in handles:
+            h.remove()
+        raise RuntimeError(f"Failed to build calibration tokens from {calib_dataset}.")
+
+    model.eval()
+    for i in tqdm(range(tokens.shape[0]), desc="Calibration Forward Pass"):
+        model(tokens[i : i + 1].to(device))
 
     for h in handles:
         h.remove()
 
-    cov_matrices = {}
-    logger.info(f"Calculating covariance matrices with shrinkage (alpha={alpha})...")
+    cov_matrices: Dict[str, torch.Tensor] = {}
+    logger.info(f"Calculating covariance matrices with shrinkage (alpha={alpha})")
 
-    layer_group_data = defaultdict(lambda: defaultdict(list))
-    individual_module_data = {}
-
-    for name, data_list in inputs.items():
-        parts = name.split(".")
-        if len(parts) < 2:
-            continue
-
-        layer_idx = extract_layer_index(name)
-        module_suffix = parts[-2]
-        group_type = module_to_group_map.get(module_suffix)
-
-        if group_type in ("qkv", "mlp"):
-            layer_group_data[layer_idx][group_type].extend(data_list)
-        else:
-            module_key = (
-                name.replace(".weight", "") if name.endswith(".weight") else name
+    for key, slot in stats.items():
+        n = max(1, slot["n"])
+        cov = slot["xtx"] / n
+        dim = cov.shape[0]
+        trace_val = torch.trace(cov)
+        if trace_val > 0:
+            identity = (trace_val / dim) * torch.eye(
+                dim, device=cov.device, dtype=cov.dtype
             )
-            individual_module_data[module_key] = data_list
-
-    total_cov_jobs = sum(
-        1
-        for groups in layer_group_data.values()
-        for data_list in groups.values()
-        if data_list
-    ) + sum(1 for data_list in individual_module_data.values() if data_list)
-    cov_pbar = (
-        tqdm(total=total_cov_jobs, desc="Covariance Shrinkage")
-        if total_cov_jobs > 0
-        else None
-    )
-
-    for layer_idx, groups in layer_group_data.items():
-        for group_type, data_list in groups.items():
-            if not data_list:
-                continue
-
-            group_key = f"layer{layer_idx}_{group_type}"
-            x_cat = torch.cat(data_list, dim=0).to(torch.float32)
-            cov = torch.matmul(x_cat.T, x_cat) / x_cat.shape[0]
-
-            d = cov.shape[0]
-            cov_trace = torch.trace(cov)
-            if cov_trace > 0:
-                identity_term = (cov_trace / d) * torch.eye(d, device=cov.device)
-                stable_cov = (1 - alpha) * cov + alpha * identity_term
-            else:
-                stable_cov = cov + (1e-6 * torch.eye(d, device=cov.device))
-            cov_matrices[group_key] = stable_cov.cpu()
-            if cov_pbar is not None:
-                cov_pbar.update(1)
-
-    for module_key, data_list in individual_module_data.items():
-        x_cat = torch.cat(data_list, dim=0).to(torch.float32)
-        cov = torch.matmul(x_cat.T, x_cat) / x_cat.shape[0]
-
-        d = cov.shape[0]
-        cov_trace = torch.trace(cov)
-        if cov_trace > 0:
-            identity_term = (cov_trace / d) * torch.eye(d, device=cov.device)
-            stable_cov = (1 - alpha) * cov + alpha * identity_term
+            cov = (1 - alpha) * cov + alpha * identity
         else:
-            stable_cov = cov + (1e-6 * torch.eye(d, device=cov.device))
-        cov_matrices[module_key] = stable_cov.cpu()
-        if cov_pbar is not None:
-            cov_pbar.update(1)
-
-    if cov_pbar is not None:
-        cov_pbar.close()
+            cov = cov + 1e-6 * torch.eye(dim, device=cov.device, dtype=cov.dtype)
+        cov_matrices[key] = cov.cpu()
 
     logger.info(f"Estimated {len(cov_matrices)} unique covariance matrices.")
     return cov_matrices
 
 
 def calculate_matrix_sqrt_and_inv_sqrt(
-    S: torch.Tensor, device: torch.device, matrix_name: Optional[str] = None
+    S: torch.Tensor, device: torch.device
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    label = matrix_name or "<unnamed>"
-    last_error = None
-
-    candidate_backends = []
-    if device.type == "cuda":
-        candidate_backends.extend(
-            [
-                ("cuda-float64", device, torch.float64),
-                ("cuda-float32", device, torch.float32),
-            ]
-        )
-    candidate_backends.append(("cpu-float64", torch.device("cpu"), torch.float64))
-
-    for backend_label, target_device, dtype in candidate_backends:
-        try:
-            S_work = S.to(target_device, dtype=dtype)
-            # Numeric noise from covariance estimation can break symmetry slightly.
-            S_work = 0.5 * (S_work + S_work.T)
-            L, Q = torch.linalg.eigh(S_work)
-
-            L = L.to(torch.float32)
-            Q = Q.to(torch.float32)
-            L_clamped = torch.clamp(L, min=1e-8)
-            L_sqrt = torch.sqrt(L_clamped)
-            L_inv_sqrt = 1.0 / L_sqrt
-
-            # Scale eigenvector columns without materializing dense diagonal matrices.
-            S_sqrt = (Q * L_sqrt.unsqueeze(0)) @ Q.T
-            S_inv_sqrt = (Q * L_inv_sqrt.unsqueeze(0)) @ Q.T
-            return S_sqrt.cpu(), S_inv_sqrt.cpu()
-        except RuntimeError as exc:
-            last_error = exc
-            logger.warning(
-                f"eigh failed for covariance '{label}' on {backend_label}; retrying. Error: {exc}"
-            )
-            if target_device.type == "cuda":
-                torch.cuda.empty_cache()
-
-    raise RuntimeError(
-        f"Failed to compute matrix sqrt/inv_sqrt for covariance '{label}' after CUDA/CPU fallbacks"
-    ) from last_error
-
-
-
+    S_gpu = S.to(device, dtype=torch.float64)
+    L, Q = torch.linalg.eigh(S_gpu)
+    L, Q = L.to(torch.float32), Q.to(torch.float32)
+    L_sqrt = torch.sqrt(torch.clamp(L, min=1e-8)).diag()
+    L_inv_sqrt = (1.0 / torch.sqrt(torch.clamp(L, min=1e-8))).diag()
+    S_sqrt = Q @ L_sqrt @ Q.T
+    S_inv_sqrt = Q @ L_inv_sqrt @ Q.T
+    return S_sqrt.cpu(), S_inv_sqrt.cpu()
 
 
 def randomized_svd_pytorch(
-    M: torch.Tensor, rank: int, n_oversamples: int = 10, n_power_iters: int = 2
+    M: torch.Tensor,
+    rank: int,
+    n_oversamples: int = 10,
+    n_power_iters: int = 2,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    q = rank + n_oversamples
     m, n = M.shape
+    max_rank = min(m, n)
+    rank = min(rank, max_rank)
+    q = min(max_rank, max(rank, rank + n_oversamples))
     Omega = torch.randn(n, q, device=M.device, dtype=M.dtype)
     Y = M @ Omega
-    for _ in range(n_power_iters):
+    for _ in range(max(0, n_power_iters)):
         Y = M @ (M.T @ Y)
     Q, _ = torch.linalg.qr(Y)
     B = Q.T @ M
@@ -319,6 +330,8 @@ def process_randomized_gsvd_group(
     Sigma_inv_sqrt: torch.Tensor,
     rank: int,
     device: torch.device,
+    n_oversamples: int,
+    n_power_iters: int,
 ) -> Tuple[List[torch.Tensor], torch.Tensor]:
     E_cat = torch.cat(E_list, dim=0).to(device, dtype=torch.float32)
     W_sqrt = Sigma_sqrt.to(device, dtype=torch.float32)
@@ -335,13 +348,12 @@ def process_randomized_gsvd_group(
 
     M = R_e @ W_sqrt
     U_m, S_vals, Vh = randomized_svd_pytorch(
-        M, rank=rank, n_oversamples=10, n_power_iters=2
+        M, rank=rank, n_oversamples=n_oversamples, n_power_iters=n_power_iters
     )
 
     U = Q_e @ U_m
     S_sqrt_diag = torch.sqrt(S_vals).diag()
 
-    
     cumulative_rows = 0
     A_final_list = []
     for E_tensor in E_list:
@@ -351,7 +363,6 @@ def process_randomized_gsvd_group(
         A_final_list.append(A_i)
         cumulative_rows += rows
 
-    
     B_temp = S_sqrt_diag @ Vh
     W_inv_sqrt = Sigma_inv_sqrt.to(device, dtype=torch.float32)
     B_shared_final = (B_temp @ W_inv_sqrt).cpu()
@@ -389,9 +400,6 @@ def process_weighted_svd_group(
     return A_final_list, B_shared_final
 
 
-
-
-
 def main(args):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -407,25 +415,44 @@ def main(args):
         args.model_name, use_fast=True, trust_remote_code=args.trust_remote_code
     )
 
-    
-    cov_matrices = estimate_input_covariance(
-        model,
-        tokenizer,
-        device,
-        args.model_name,
-        nsamples=args.nsamples,
-        seqlen=args.seqlen,
-        alpha=args.shrinkage_alpha,
-        calibration_dataset=args.calibration_dataset,
-    )
+    matmul_dtype = resolve_torch_dtype(args.matmul_dtype)
+
+    cov_matrices: Dict[str, torch.Tensor]
+    if (
+        args.reuse_cov_stats
+        and args.cov_stats_path
+        and os.path.isfile(args.cov_stats_path)
+    ):
+        logger.info(f"Loading cached covariance statistics from {args.cov_stats_path}")
+        cov_matrices = torch.load(args.cov_stats_path, map_location="cpu")
+    else:
+        if args.reuse_cov_stats and args.cov_stats_path:
+            logger.info(
+                f"Cached covariance statistics not found at {args.cov_stats_path}; recomputing."
+            )
+        cov_matrices = estimate_input_covariance(
+            model,
+            tokenizer,
+            device,
+            args.model_name,
+            nsamples=args.nsamples,
+            seqlen=args.seqlen,
+            alpha=args.shrinkage_alpha,
+            calib_dataset=args.calib_dataset,
+            calib_config=args.calib_config,
+            cov_store_device=args.cov_store_device,
+            matmul_dtype=matmul_dtype,
+        )
+        if args.cov_stats_path:
+            os.makedirs(os.path.dirname(args.cov_stats_path) or ".", exist_ok=True)
+            torch.save({k: v.cpu() for k, v in cov_matrices.items()}, args.cov_stats_path)
+
     del model
     torch.cuda.empty_cache()
 
     sqrt_matrices = {}
     for name, cov in tqdm(cov_matrices.items(), desc="Calculating Matrix Square Roots"):
-        sqrt_matrices[name] = calculate_matrix_sqrt_and_inv_sqrt(
-            cov, device, matrix_name=name
-        )
+        sqrt_matrices[name] = calculate_matrix_sqrt_and_inv_sqrt(cov, device)
 
     layer_groups = build_groups(err_T, args.model_name)
 
@@ -436,7 +463,6 @@ def main(args):
         f"Starting Randomized GSVD processing for rank={args.max_rank} on {args.model_name}..."
     )
 
-    
     for gk, names in tqdm(
         layer_groups.items(), desc="Processing Shared-B Groups with Randomized GSVD"
     ):
@@ -448,7 +474,14 @@ def main(args):
         E_list = [err_T[n] for n in names]
 
         A_list, B_shared = process_randomized_gsvd_group(
-            E_list, names, Sigma_sqrt, Sigma_inv_sqrt, args.max_rank, device
+            E_list,
+            names,
+            Sigma_sqrt,
+            Sigma_inv_sqrt,
+            args.max_rank,
+            device,
+            args.oversamples,
+            args.power_iters,
         )
 
         b_key_shared = f"{gk}.B_shared"
@@ -460,7 +493,6 @@ def main(args):
             shared[a_key] = A_list[i].to(torch.float16)
             b_ref_map[name] = b_key_shared
 
-    
     grouped_names = {n for names in layer_groups.values() for n in names}
     solo_names = sorted([n for n in err_T if n not in grouped_names and "layers" in n])
 
@@ -474,7 +506,14 @@ def main(args):
 
         Sigma_sqrt, Sigma_inv_sqrt = sqrt_matrices[module_name]
         A_list, B = process_randomized_gsvd_group(
-            [err_T[name]], [name], Sigma_sqrt, Sigma_inv_sqrt, args.max_rank, device
+            [err_T[name]],
+            [name],
+            Sigma_sqrt,
+            Sigma_inv_sqrt,
+            args.max_rank,
+            device,
+            args.oversamples,
+            args.power_iters,
         )
 
         a_key, b_key = f"{module_name}.A", f"{module_name}.B"
@@ -482,7 +521,6 @@ def main(args):
         shared[b_key] = B.to(torch.float16)
         b_ref_map[name] = b_key
 
-    
     os.makedirs(args.output_path, exist_ok=True)
     torch.save(shared, os.path.join(args.output_path, "low_rank_shared.pt"))
     with open(os.path.join(args.output_path, "b_ref_map.json"), "w") as f:
@@ -522,25 +560,71 @@ if __name__ == "__main__":
         help="Set for models like Qwen requiring custom code.",
     )
     p.add_argument("--max_rank", type=int, default=64, help="Maximum rank for SVD.")
-    
-    p.add_argument(
-        "--nsamples", type=int, default=32, help="Number of calibration samples."
-    )
-    p.add_argument(
-        "--calibration_dataset",
-        type=str,
-        default="DKYoon/SlimPajama-6B",
-        help="HF dataset name to stream for covariance calibration.",
-    )
-    p.add_argument(
-        "--seqlen", type=int, default=2048, help="Sequence length for calibration."
-    )
     p.add_argument(
         "--shrinkage_alpha",
         type=float,
         default=0.05,
         help="Alpha for covariance matrix shrinkage.",
     )
-
+    p.add_argument(
+        "--nsamples",
+        type=int,
+        default=64,
+        help="Number of calibration samples for covariance estimation.",
+    )
+    p.add_argument(
+        "--seqlen",
+        type=int,
+        default=2048,
+        help="Sequence length for calibration tokens.",
+    )
+    p.add_argument(
+        "--calib_dataset",
+        type=str,
+        default="wikitext",
+        help="Calibration dataset identifier (HF datasets format).",
+    )
+    p.add_argument(
+        "--calib_config",
+        type=str,
+        default=None,
+        help="Optional config name for the calibration dataset.",
+    )
+    p.add_argument(
+        "--cov_store_device",
+        type=str,
+        default="cpu",
+        help="Device used to accumulate covariance statistics (e.g., cpu or cuda).",
+    )
+    p.add_argument(
+        "--oversamples",
+        type=int,
+        default=10,
+        help="Oversampling parameter for randomized SVD.",
+    )
+    p.add_argument(
+        "--power_iters",
+        type=int,
+        default=2,
+        help="Power iteration count for randomized SVD.",
+    )
+    p.add_argument(
+        "--cov_stats_path",
+        type=str,
+        default=None,
+        help="Path to cache covariance statistics (XtX).",
+    )
+    p.add_argument(
+        "--reuse_cov_stats",
+        type=str2bool,
+        default=False,
+        help="Reuse cached covariance statistics when available.",
+    )
+    p.add_argument(
+        "--matmul_dtype",
+        type=str,
+        default="float32",
+        help="Torch dtype name used for XtX accumulation (e.g., float32, float16).",
+    )
     args = p.parse_args()
     main(args)

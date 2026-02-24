@@ -222,6 +222,7 @@ def run_step1(cfg: dict, paths: dict[str, Path]) -> None:
 def run_step2(cfg: dict, paths: dict[str, Path]) -> None:
     with _step_color_output("step2"):
         step2 = _import_src_module("step2_randomized_gsvd_integrated")
+        cov_stats_path = _cfg_get(cfg, "cov_stats_path", None)
         args = argparse.Namespace(
             model_name=str(_require(cfg, "model_name")),
             err_path=str(paths["quant_err_path"]),
@@ -229,16 +230,23 @@ def run_step2(cfg: dict, paths: dict[str, Path]) -> None:
             trust_remote_code=bool(_cfg_get(cfg, "trust_remote_code", False)),
             max_rank=int(_require(cfg, "svd_rank")),
             nsamples=int(_require(cfg, "calibration_n_samples")),
-            calibration_dataset=str(
+            calib_dataset=str(
                 _cfg_get(cfg, "calibration_dataset", "DKYoon/SlimPajama-6B")
             ),
+            calib_config=_cfg_get(cfg, "calibration_dataset_config", _cfg_get(cfg, "calib_config", None)),
             seqlen=int(_cfg_get(cfg, "calibration_seq_len", 2048)),
             shrinkage_alpha=float(_cfg_get(cfg, "shrinkage_alpha", 0.05)),
+            cov_store_device=str(_cfg_get(cfg, "cov_store_device", "cpu")),
+            oversamples=int(_cfg_get(cfg, "oversamples", 10)),
+            power_iters=int(_cfg_get(cfg, "power_iters", 2)),
+            cov_stats_path=(str(cov_stats_path) if cov_stats_path is not None else None),
+            reuse_cov_stats=bool(_cfg_get(cfg, "reuse_cov_stats", False)),
+            matmul_dtype=str(_cfg_get(cfg, "matmul_dtype", "float32")),
         )
 
         print("\n[GlowQ] Step2 start: randomized GSVD")
         print(
-            f"[GlowQ] Step2 config: rank={args.max_rank}, calib_dataset={args.calibration_dataset}, nsamples={args.nsamples}"
+            f"[GlowQ] Step2 config: rank={args.max_rank}, calib_dataset={args.calib_dataset}, nsamples={args.nsamples}"
         )
         step2.main(args)
         print("[GlowQ] Step2 done")
