@@ -48,6 +48,40 @@ except Exception:
     HAS_CUDA_W4A16 = False
 
 
+def _configure_cuda_w4a16_env(args) -> None:
+    if not HAS_CUDA_W4A16:
+        return
+
+    os.environ.setdefault("W4A16_KERNEL_OUT_DTYPE", "fp16")
+    os.environ.setdefault("W4A16_GEMM_CUDA", "1")
+    os.environ.setdefault("W4A16_DEQUANT_CACHE", "0")
+
+    if getattr(args, "cuda_w4a16_kernel_out_dtype", None):
+        os.environ["W4A16_KERNEL_OUT_DTYPE"] = args.cuda_w4a16_kernel_out_dtype
+    if getattr(args, "cuda_w4a16_gemv_m_max", None) is not None:
+        os.environ["W4A16_GEMV_M_MAX"] = str(int(args.cuda_w4a16_gemv_m_max))
+    if getattr(args, "cuda_w4a16_dequant_chunk", None) is not None:
+        os.environ["W4A16_DEQUANT_CHUNK"] = str(int(args.cuda_w4a16_dequant_chunk))
+    if getattr(args, "cuda_w4a16_dequant_cache", False):
+        os.environ["W4A16_DEQUANT_CACHE"] = "1"
+    if getattr(args, "cuda_w4a16_force_gemm", False):
+        os.environ["W4A16_FORCE_GEMM"] = "1"
+        os.environ.pop("W4A16_FORCE_GEMV", None)
+    if getattr(args, "cuda_w4a16_force_gemv", False):
+        os.environ["W4A16_FORCE_GEMV"] = "1"
+        os.environ.pop("W4A16_FORCE_GEMM", None)
+
+    print(
+        "[CUDA W4A16] env:"
+        f" out_dtype={os.environ.get('W4A16_KERNEL_OUT_DTYPE')}"
+        f", gemv_m_max={os.environ.get('W4A16_GEMV_M_MAX', '(default)')}"
+        f", force_gemm={os.environ.get('W4A16_FORCE_GEMM', '0')}"
+        f", force_gemv={os.environ.get('W4A16_FORCE_GEMV', '0')}"
+        f", dequant_chunk={os.environ.get('W4A16_DEQUANT_CHUNK', '(default)')}"
+        f", dequant_cache={os.environ.get('W4A16_DEQUANT_CACHE', '0')}"
+    )
+
+
 def _role_from_suffix(sfx: str) -> str:
     if sfx.endswith("q_proj"):
         return "q"
@@ -191,6 +225,7 @@ def run_evaluation(
 def main(args):
     device = torch.device(args.device)
     os.makedirs(args.output_dir, exist_ok=True)
+    _configure_cuda_w4a16_env(args)
 
     with open(args.rankings_json, "r") as f:
         loaded_rankings = json.load(f)
@@ -313,6 +348,40 @@ if __name__ == "__main__":
         "--trust_remote_code",
         action="store_true",
         help="Set for models requiring custom Hugging Face code (e.g., some Qwen variants).",
+    )
+    parser.add_argument(
+        "--cuda_w4a16_kernel_out_dtype",
+        type=str,
+        default=None,
+        choices=["fp16", "fp32"],
+        help="Override W4A16 kernel output dtype (default step4 sets fp16 when CUDA W4A16 path is available)",
+    )
+    parser.add_argument(
+        "--cuda_w4a16_gemv_m_max",
+        type=int,
+        default=None,
+        help="Prefer GEMV when M<=this threshold (W4A16_GEMV_M_MAX)",
+    )
+    parser.add_argument(
+        "--cuda_w4a16_dequant_chunk",
+        type=int,
+        default=None,
+        help="Chunk size for W4A16 dequant+matmul fallback/GEMM path",
+    )
+    parser.add_argument(
+        "--cuda_w4a16_dequant_cache",
+        action="store_true",
+        help="Enable fp16 dequant weight cache in W4A16 path",
+    )
+    parser.add_argument(
+        "--cuda_w4a16_force_gemm",
+        action="store_true",
+        help="Force W4A16 GEMM/dequant path",
+    )
+    parser.add_argument(
+        "--cuda_w4a16_force_gemv",
+        action="store_true",
+        help="Force W4A16 GEMV path",
     )
     args = parser.parse_args()
     main(args)

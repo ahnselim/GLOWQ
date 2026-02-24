@@ -30,7 +30,6 @@ importance_metric = "gsvd,norm_error"
 
 # Optional step3 settings
 skip_gen = false
-eval_max_docs = 64
 eval_seq_len = 2048
 
 # Optional harness settings (used when lm_harness = true)

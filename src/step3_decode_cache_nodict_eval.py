@@ -40,6 +40,40 @@ except Exception:
     )
 
 
+def _configure_cuda_w4a16_env(args) -> None:
+    if not getattr(args, "use_cuda_w4a16", False):
+        return
+
+    os.environ.setdefault("W4A16_KERNEL_OUT_DTYPE", "fp16")
+    os.environ.setdefault("W4A16_GEMM_CUDA", "1")
+    os.environ.setdefault("W4A16_DEQUANT_CACHE", "0")
+
+    if getattr(args, "cuda_w4a16_kernel_out_dtype", None):
+        os.environ["W4A16_KERNEL_OUT_DTYPE"] = args.cuda_w4a16_kernel_out_dtype
+    if getattr(args, "cuda_w4a16_gemv_m_max", None) is not None:
+        os.environ["W4A16_GEMV_M_MAX"] = str(int(args.cuda_w4a16_gemv_m_max))
+    if getattr(args, "cuda_w4a16_dequant_chunk", None) is not None:
+        os.environ["W4A16_DEQUANT_CHUNK"] = str(int(args.cuda_w4a16_dequant_chunk))
+    if getattr(args, "cuda_w4a16_dequant_cache", False):
+        os.environ["W4A16_DEQUANT_CACHE"] = "1"
+    if getattr(args, "cuda_w4a16_force_gemm", False):
+        os.environ["W4A16_FORCE_GEMM"] = "1"
+        os.environ.pop("W4A16_FORCE_GEMV", None)
+    if getattr(args, "cuda_w4a16_force_gemv", False):
+        os.environ["W4A16_FORCE_GEMV"] = "1"
+        os.environ.pop("W4A16_FORCE_GEMM", None)
+
+    print(
+        "[CUDA W4A16] env:"
+        f" out_dtype={os.environ.get('W4A16_KERNEL_OUT_DTYPE')}"
+        f", gemv_m_max={os.environ.get('W4A16_GEMV_M_MAX', '(default)')}"
+        f", force_gemm={os.environ.get('W4A16_FORCE_GEMM', '0')}"
+        f", force_gemv={os.environ.get('W4A16_FORCE_GEMV', '0')}"
+        f", dequant_chunk={os.environ.get('W4A16_DEQUANT_CHUNK', '(default)')}"
+        f", dequant_cache={os.environ.get('W4A16_DEQUANT_CACHE', '0')}"
+    )
+
+
 def _safe_cuda_empty_cache(context: str) -> bool:
     if not torch.cuda.is_available():
         return True
@@ -891,6 +925,40 @@ def main():
         help="Use custom CUDA W4A16 kernels instead of Triton",
     )
     p.add_argument(
+        "--cuda_w4a16_kernel_out_dtype",
+        type=str,
+        default=None,
+        choices=["fp16", "fp32"],
+        help="Override W4A16 kernel output dtype (default step3 sets fp16)",
+    )
+    p.add_argument(
+        "--cuda_w4a16_gemv_m_max",
+        type=int,
+        default=None,
+        help="Prefer GEMV when M<=this threshold (W4A16_GEMV_M_MAX)",
+    )
+    p.add_argument(
+        "--cuda_w4a16_dequant_chunk",
+        type=int,
+        default=None,
+        help="Chunk size for W4A16 dequant+matmul fallback/GEMM path",
+    )
+    p.add_argument(
+        "--cuda_w4a16_dequant_cache",
+        action="store_true",
+        help="Enable fp16 dequant weight cache in W4A16 path",
+    )
+    p.add_argument(
+        "--cuda_w4a16_force_gemm",
+        action="store_true",
+        help="Force W4A16 GEMM/dequant path",
+    )
+    p.add_argument(
+        "--cuda_w4a16_force_gemv",
+        action="store_true",
+        help="Force W4A16 GEMV path",
+    )
+    p.add_argument(
         "--skip_baseline_eval",
         action="store_true",
         help="Skip Wq-only baseline evaluation and print only GlowQ (SVD) results",
@@ -909,8 +977,8 @@ def main():
     p.add_argument(
         "--eval_max_docs",
         type=int,
-        default=64,
-        help="Maximum number of documents (to control memory/time)",
+        default=None,
+        help="Maximum number of documents (default: None, use full split like eval_fp16_ppl.py)",
     )
     p.add_argument(
         "--eval_max_chars",
@@ -919,6 +987,11 @@ def main():
         help="Character limit (when documents are too long)",
     )
     p.add_argument("--eval_seq_len", type=int, default=2048, help="PPL window size (tokens)")
+    p.add_argument(
+        "--use_fast_tokenizer",
+        action="store_true",
+        help="Use fast tokenizer (default False to match eval_fp16_ppl.py)",
+    )
     p.add_argument(
         "--eval_hf_name", default=None, help="HF dataset name when --eval_dataset=hf"
     )
@@ -933,7 +1006,9 @@ def main():
 
     
     tokenizer = AutoTokenizer.from_pretrained(
-        args.model_name, use_fast=True, trust_remote_code=args.trust_remote_code
+        args.model_name,
+        use_fast=args.use_fast_tokenizer,
+        trust_remote_code=args.trust_remote_code,
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -966,6 +1041,7 @@ def main():
 
     
     if args.use_cuda_w4a16:
+        _configure_cuda_w4a16_env(args)
         print("🔄 Converting model to CUDA W4A16...")
         try:
             from cuda_w4a16.linear import convert_to_cuda_w4a16

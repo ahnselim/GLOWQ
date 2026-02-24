@@ -342,6 +342,7 @@ def run_step3(cfg: dict, paths: dict[str, Path]) -> None:
             "eval_max_docs",
             "eval_max_chars",
             "eval_seq_len",
+            "use_fast_tokenizer",
             "eval_hf_name",
             "eval_hf_config",
             "eval_text_field",

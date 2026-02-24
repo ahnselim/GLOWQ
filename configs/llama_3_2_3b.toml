@@ -15,7 +15,7 @@ lm_harness = false
 # Optional runtime settings
 device = "cuda:0"
 group_size = 128
-use_cuda_w4a16 = false
+use_cuda_w4a16 = true
 trust_remote_code = false
 calibration_seq_len = 2048
 output_dir = "outputs/llama_3_2_3b"
@@ -30,7 +30,6 @@ importance_metric = "gsvd,norm_error"
 
 # Optional step3 settings
 skip_gen = false
-eval_max_docs = 64
 eval_seq_len = 2048
 
 # Optional harness settings (used when lm_harness = true)

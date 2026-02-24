@@ -41,6 +41,30 @@ except Exception:
         "Triton is not available or disabled. If needed, install with 'pip install triton'."
     )
 
+
+def _configure_cuda_w4a16_env(args) -> None:
+    if not getattr(args, "use_cuda_w4a16", False):
+        return
+
+    os.environ.setdefault("W4A16_KERNEL_OUT_DTYPE", "fp16")
+    os.environ.setdefault("W4A16_GEMM_CUDA", "1")
+    os.environ.setdefault("W4A16_DEQUANT_CACHE", "0")
+
+    if getattr(args, "cuda_w4a16_kernel_out_dtype", None):
+        os.environ["W4A16_KERNEL_OUT_DTYPE"] = args.cuda_w4a16_kernel_out_dtype
+    if getattr(args, "cuda_w4a16_gemv_m_max", None) is not None:
+        os.environ["W4A16_GEMV_M_MAX"] = str(int(args.cuda_w4a16_gemv_m_max))
+    if getattr(args, "cuda_w4a16_dequant_chunk", None) is not None:
+        os.environ["W4A16_DEQUANT_CHUNK"] = str(int(args.cuda_w4a16_dequant_chunk))
+    if getattr(args, "cuda_w4a16_dequant_cache", False):
+        os.environ["W4A16_DEQUANT_CACHE"] = "1"
+    if getattr(args, "cuda_w4a16_force_gemm", False):
+        os.environ["W4A16_FORCE_GEMM"] = "1"
+        os.environ.pop("W4A16_FORCE_GEMV", None)
+    if getattr(args, "cuda_w4a16_force_gemv", False):
+        os.environ["W4A16_FORCE_GEMV"] = "1"
+        os.environ.pop("W4A16_FORCE_GEMM", None)
+
 def get_parent_module(model, name):
     parts = name.split(".")
     parent = model
@@ -213,13 +237,14 @@ def evaluate(model, tokenizer, device, model_name, batch_size=1, seq_len=2048):
     end_time = time.time(); ppl = math.exp(total_loss / total_tokens); elapsed_time = end_time - start_time; print(f"✅ Result for {model_name}: PPL = {ppl:.4f}, Time = {elapsed_time:.2f}s"); return ppl, elapsed_time
 
 def main():
-    p = argparse.ArgumentParser(description="Evaluate Layer-wise model with NO CACHING - All layers perform A@B@X matmul."); p.add_argument("--model_name", required=True); p.add_argument("--shared_path", required=True); p.add_argument("--bmap_path", required=True); p.add_argument("--original_weights_path", required=True); p.add_argument("--device", default="cuda:0"); p.add_argument("--trust_remote_code", action="store_true"); p.add_argument("--group_size", type=int, default=128); p.add_argument("--skip_gen", action="store_true"); p.add_argument("--gen_max_new_tokens", type=int, default=50); p.add_argument("--gen_repeats", type=int, default=1); p.add_argument("--use_cuda_w4a16", action="store_true"); p.add_argument("--batch_size", type=int, default=1); p.add_argument("--eval_seq_len", type=int, default=2048); args = p.parse_args()
+    p = argparse.ArgumentParser(description="Evaluate Layer-wise model with NO CACHING - All layers perform A@B@X matmul."); p.add_argument("--model_name", required=True); p.add_argument("--shared_path", required=True); p.add_argument("--bmap_path", required=True); p.add_argument("--original_weights_path", required=True); p.add_argument("--device", default="cuda:0"); p.add_argument("--trust_remote_code", action="store_true"); p.add_argument("--group_size", type=int, default=128); p.add_argument("--skip_gen", action="store_true"); p.add_argument("--gen_max_new_tokens", type=int, default=50); p.add_argument("--gen_repeats", type=int, default=1); p.add_argument("--use_cuda_w4a16", action="store_true"); p.add_argument("--cuda_w4a16_kernel_out_dtype", type=str, default=None, choices=["fp16", "fp32"]); p.add_argument("--cuda_w4a16_gemv_m_max", type=int, default=None); p.add_argument("--cuda_w4a16_dequant_chunk", type=int, default=None); p.add_argument("--cuda_w4a16_dequant_cache", action="store_true"); p.add_argument("--cuda_w4a16_force_gemm", action="store_true"); p.add_argument("--cuda_w4a16_force_gemv", action="store_true"); p.add_argument("--batch_size", type=int, default=1); p.add_argument("--eval_seq_len", type=int, default=2048); args = p.parse_args()
     device = torch.device(args.device); tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True, trust_remote_code=args.trust_remote_code)
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
     default_prompts = ["Hello, my name is", "The quick brown fox", "In a shocking finding, scientists discovered that"]
     print(f"📥 Loading original FP16 model: {args.model_name}"); model_fp16 = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float16, device_map="cpu", trust_remote_code=args.trust_remote_code)
     print(f"📥 Loading original weights from: {args.original_weights_path}"); original_weights = torch.load(args.original_weights_path, map_location="cpu", weights_only=True); model_fp16.load_state_dict(original_weights)
     if args.use_cuda_w4a16:
+        _configure_cuda_w4a16_env(args)
         print("🔄 Converting model to CUDA W4A16..."); from cuda_w4a16.linear import convert_to_cuda_w4a16; model = convert_to_cuda_w4a16(model_fp16, group_size=args.group_size).to(device); method_label = "CUDA W4A16"
     else:
         print(f"🔄 Converting to Triton 4-bit..."); model = convert_to_triton_4bit(model_fp16, group_size=args.group_size).to(device); method_label = "Triton 4-bit"

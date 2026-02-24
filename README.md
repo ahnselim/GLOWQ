@@ -47,7 +47,7 @@ Use a CUDA-enabled PyTorch wheel (as above). This is usually enough to run the m
 
 ### When You Also Need CUDA Toolkit (`nvcc`)
 
-If you enable the custom CUDA extension path (e.g., `use_cuda_w4a16 = true`), PyTorch may compile CUDA extensions at runtime. In that case, install a matching CUDA Toolkit on the system.
+If you enable the custom CUDA extension path (e.g., `use_cuda_w4a16 = true`), you will need to build the CUDA extension (recommended) or allow runtime JIT fallback. In either case, install a matching CUDA Toolkit on the system.
 
 Checklist:
 
@@ -79,27 +79,60 @@ export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 
 ### Using the Custom CUDA W4A16 Kernel (Step3)
 
-GlowQ's W4A16 path uses a custom CUDA extension in `src/cuda_w4a16/` and is built at runtime via `torch.utils.cpp_extension.load(...)` (JIT build). You do not need a separate `setup.py` install step.
+GlowQ's W4A16 path uses a custom CUDA extension in `src/cuda_w4a16/`.
 
-To enable it:
+Current default behavior is **prebuilt extension import** (recommended), not runtime JIT build.
 
-1. In your config (`.toml`), set `use_cuda_w4a16 = true`.
-2. Run the pipeline as usual (for example, `python run_glowq.py qwen_2_5_7b.toml`).
-3. On the first run, PyTorch may compile the CUDA extension (this can take time).
+#### Build the CUDA Extension (Recommended)
+
+Build once (or rebuild after editing CUDA sources):
+
+```bash
+cd GlowQ/src
+
+# Set CUDA arch explicitly if auto-detection is unreliable on your server
+# Example for A100: 8.0
+export TORCH_CUDA_ARCH_LIST=8.0
+
+python setup_cuda_w4a16.py build_ext --inplace
+```
+
+This produces a compiled module under:
+
+- `GlowQ/src/cuda_w4a16/w4a16_kernels*.so`
+
+Optional build knobs:
+
+```bash
+export MAX_JOBS=8            # parallel compile jobs (ninja)
+export CUDA_HOME=/usr/local/cuda
+```
+
+#### Enable It in Step3
+
+1. Build the extension (above).
+2. In your config (`.toml`), set `use_cuda_w4a16 = true`.
+3. Run the pipeline as usual (for example, `python run_glowq.py qwen_2_5_7b.toml`).
 
 Expected Step3 log when enabled:
 
 - `Converting model to CUDA W4A16...`
 
-If the build/import fails:
+If import/build fails:
 
 - Confirm `nvcc --version` works and matches your CUDA/PyTorch environment.
 - Confirm `CUDA_HOME` is set correctly (see example above).
-- Optionally set `TORCH_EXTENSIONS_DIR` to a writable cache directory for extension builds:
+- Rebuild after CUDA source changes: `python setup_cuda_w4a16.py build_ext --inplace`
+
+#### Optional Runtime JIT Fallback (Debug/Dev Only)
+
+If you intentionally want the old runtime JIT fallback path:
 
 ```bash
-export TORCH_EXTENSIONS_DIR=/tmp/torch_extensions
+export W4A16_ALLOW_JIT=1
 ```
+
+Then the extension can fall back to `torch.utils.cpp_extension.load(...)` when the prebuilt module is missing.
 
 ## Pipelines
 

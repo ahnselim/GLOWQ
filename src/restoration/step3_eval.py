@@ -46,6 +46,40 @@ except Exception:
         "Triton is not available or disabled. If needed, install with 'pip install triton'."
     )
 
+
+def _configure_cuda_w4a16_env(args) -> None:
+    if not getattr(args, "use_cuda_w4a16", False):
+        return
+
+    os.environ.setdefault("W4A16_KERNEL_OUT_DTYPE", "fp16")
+    os.environ.setdefault("W4A16_GEMM_CUDA", "1")
+    os.environ.setdefault("W4A16_DEQUANT_CACHE", "0")
+
+    if getattr(args, "cuda_w4a16_kernel_out_dtype", None):
+        os.environ["W4A16_KERNEL_OUT_DTYPE"] = args.cuda_w4a16_kernel_out_dtype
+    if getattr(args, "cuda_w4a16_gemv_m_max", None) is not None:
+        os.environ["W4A16_GEMV_M_MAX"] = str(int(args.cuda_w4a16_gemv_m_max))
+    if getattr(args, "cuda_w4a16_dequant_chunk", None) is not None:
+        os.environ["W4A16_DEQUANT_CHUNK"] = str(int(args.cuda_w4a16_dequant_chunk))
+    if getattr(args, "cuda_w4a16_dequant_cache", False):
+        os.environ["W4A16_DEQUANT_CACHE"] = "1"
+    if getattr(args, "cuda_w4a16_force_gemm", False):
+        os.environ["W4A16_FORCE_GEMM"] = "1"
+        os.environ.pop("W4A16_FORCE_GEMV", None)
+    if getattr(args, "cuda_w4a16_force_gemv", False):
+        os.environ["W4A16_FORCE_GEMV"] = "1"
+        os.environ.pop("W4A16_FORCE_GEMM", None)
+
+    print(
+        "[CUDA W4A16] env:"
+        f" out_dtype={os.environ.get('W4A16_KERNEL_OUT_DTYPE')}"
+        f", gemv_m_max={os.environ.get('W4A16_GEMV_M_MAX', '(default)')}"
+        f", force_gemm={os.environ.get('W4A16_FORCE_GEMM', '0')}"
+        f", force_gemv={os.environ.get('W4A16_FORCE_GEMV', '0')}"
+        f", dequant_chunk={os.environ.get('W4A16_DEQUANT_CHUNK', '(default)')}"
+        f", dequant_cache={os.environ.get('W4A16_DEQUANT_CACHE', '0')}"
+    )
+
 if HAS_TRITON:
 
     @triton.jit
@@ -715,6 +749,40 @@ def main():
         action="store_true",
         help="Use custom CUDA W4A16 kernels instead of Triton",
     )
+    p.add_argument(
+        "--cuda_w4a16_kernel_out_dtype",
+        type=str,
+        default=None,
+        choices=["fp16", "fp32"],
+        help="Override W4A16 kernel output dtype (default step3 sets fp16)",
+    )
+    p.add_argument(
+        "--cuda_w4a16_gemv_m_max",
+        type=int,
+        default=None,
+        help="Prefer GEMV when M<=this threshold (W4A16_GEMV_M_MAX)",
+    )
+    p.add_argument(
+        "--cuda_w4a16_dequant_chunk",
+        type=int,
+        default=None,
+        help="Chunk size for W4A16 dequant+matmul fallback/GEMM path",
+    )
+    p.add_argument(
+        "--cuda_w4a16_dequant_cache",
+        action="store_true",
+        help="Enable fp16 dequant weight cache in W4A16 path",
+    )
+    p.add_argument(
+        "--cuda_w4a16_force_gemm",
+        action="store_true",
+        help="Force W4A16 GEMM/dequant path",
+    )
+    p.add_argument(
+        "--cuda_w4a16_force_gemv",
+        action="store_true",
+        help="Force W4A16 GEMV path",
+    )
 
     args = p.parse_args()
     device = torch.device(args.device)
@@ -741,14 +809,24 @@ def main():
     )
     model_fp16.load_state_dict(original_weights)
 
-    try:
-        from cuda_w4a16.linear import convert_to_cuda_w4a16
+    if args.use_cuda_w4a16:
+        _configure_cuda_w4a16_env(args)
+        try:
+            from cuda_w4a16.linear import convert_to_cuda_w4a16
 
-        print("🔄 Converting model to CUDA W4A16 ...")
-        model = convert_to_cuda_w4a16(model_fp16, group_size=args.group_size).to(device)
-        method_label = "CUDA W4A16"
-    except Exception as e:
-        print(f"⚠️ CUDA W4A16 import failed ({e}); falling back to Triton 4-bit.")
+            print("🔄 Converting model to CUDA W4A16 ...")
+            model = convert_to_cuda_w4a16(model_fp16, group_size=args.group_size).to(device)
+            method_label = "CUDA W4A16"
+        except Exception as e:
+            print(f"⚠️ CUDA W4A16 import failed ({e}); falling back to Triton 4-bit.")
+            print(
+                f"🔄 Converting original {args.model_name} model to Triton 4-bit ..."
+            )
+            model = convert_to_triton_4bit(model_fp16, group_size=args.group_size).to(
+                device
+            )
+            method_label = "Triton 4-bit"
+    else:
         print(
             f"🔄 Converting original {args.model_name} model to Triton 4-bit ..."
         )
